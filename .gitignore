@@ -27,3 +27,17 @@ src/routeTree.gen.ts
 *.jks
 *.keystore
 *.p12
+
+# Generated build output and signing material — none of it is source.
+#   android/    created by the CI workflow with npx cap add android, and only used by
+#               the workflow when it is ABSENT from the repository, so a committed stale
+#               copy would put the runner on the wrong branch with old files.
+#   www-store/  created by bun run store:www:ios|android (tools/make-store-www.sh) and
+#               rebuilt by the workflow before Capacitor copies it into the app.
+#   key.p8      Apple Team API key / private keys. Signing material lives OUTSIDE this
+#               repository; these rules are belt-and-braces, not the plan.
+#   id_rsa*     SSH private keys.
+*.p8
+id_rsa*
+/android/
+/www-store/
