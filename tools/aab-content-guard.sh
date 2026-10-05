@@ -45,14 +45,47 @@
 #  server — the same failure `bun run store:www` guards for, checked again on the
 #  artifact.
 #
+#  A CHECK THAT DID NOT RUN IS NEVER A PASS, AND NEVER SILENCE. Nothing in here may
+#  end the script without saying why it did (see "NEVER FAIL SILENTLY" below): an
+#  input that is missing or unreadable is reported as a check that could not run,
+#  with the sentence naming it, and the exit is non-zero only for a real failure.
+#
 #  Usage:
 #     bash tools/aab-content-guard.sh <path/to/app-release.aab> [https://host/api] [ios|android]
 #  Exit: 0 = the bundle is the store build, of the edition asked for; 1 = it is not,
 #  and the log says which file carried which marker or which phrase.
 # =====================================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+#  ---- NEVER FAIL SILENTLY ------------------------------------------------------------
+#  Every check below prints what it decided. These two traps are the insurance for the
+#  paths nobody thought of: under `set -e` one failing step — a directory that is not
+#  there, a file that cannot be read — used to be able to end this script with NO output
+#  at all after the last PASS line. A guard that exits 1 in silence is worse than no
+#  guard, because it looks like a verdict while saying nothing. So:
+#    • `guard_reported` is set to 1 by every path that prints an outcome of its own; and
+#    • if the script still ends non-zero without one, the EXIT trap prints the reason.
+#  This changes no verdict: it only decides whether the exit is explained.
+guard_reported=0
+GUARD_FAILED_AT=""
+trap 'GUARD_FAILED_AT="line $LINENO: $BASH_COMMAND"' ERR
+
+guard_finish() { # EXIT: clean up, and explain an unexplained non-zero exit
+  local code=$?
+  rm -rf "${WORK:-}"
+  if [ "$code" != 0 ] && [ "${guard_reported:-0}" = 0 ]; then
+    {
+      echo
+      echo "aab-content-guard: FAIL — the guard ended (exit $code) without saying which check"
+      echo "  failed, so this bundle is NOT cleared for upload. A check that did not run is"
+      echo "  not a pass. The step that stopped it was:"
+      echo "  ${GUARD_FAILED_AT:-an unidentified step (re-run and watch the last line it printed)}"
+    } >&2
+  fi
+}
+trap guard_finish EXIT
 
 AAB="${1:-}"
 EXPECTED_API_BASE="${2:-}"
@@ -60,10 +93,12 @@ EDITION="${3:-android}"
 
 if [ -z "$AAB" ] || [ ! -f "$AAB" ]; then
   echo "usage: bash tools/aab-content-guard.sh <path/to/app-release.aab> [expected-api-base] [ios|android]" >&2
+  guard_reported=1
   exit 2
 fi
 if [ "$EDITION" != "android" ] && [ "$EDITION" != "ios" ]; then
   echo "aab-content-guard: the edition must be 'android' (the free Play download) or 'ios' (the paid App Store download); got '$EDITION'" >&2
+  guard_reported=1
   exit 2
 fi
 # The edition rules live in one place, shared with the store guard that runs on
@@ -74,15 +109,16 @@ if ! command -v bun >/dev/null 2>&1; then
   echo "aab-content-guard: bun is not on this machine, so the store-edition wording check cannot run." >&2
   echo "  It is not optional: it is what proves the app in this bundle says the right thing about" >&2
   echo "  its price. Install bun (the Android workflow sets it up before this step) and re-run." >&2
+  guard_reported=1
   exit 2
 fi
 if ! command -v unzip >/dev/null 2>&1; then
   echo "aab-content-guard: unzip is not on this machine" >&2
+  guard_reported=1
   exit 2
 fi
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 
 echo "aab-content-guard: inspecting $AAB ($(du -h "$AAB" | cut -f1)), expecting the $EDITION edition"
 
@@ -90,6 +126,7 @@ echo "aab-content-guard: inspecting $AAB ($(du -h "$AAB" | cut -f1)), expecting 
 if ! unzip -l "$AAB" > "$WORK/entries.txt" 2>"$WORK/unzip.err"; then
   echo "aab-content-guard: FAIL — this is not a readable zip archive, so it is not an .aab" >&2
   cat "$WORK/unzip.err" >&2
+  guard_reported=1
   exit 1
 fi
 entries="$(grep -c 'base/' "$WORK/entries.txt" || true)"
@@ -99,6 +136,7 @@ echo "  $entries entries under base/ (the Android module)"
 if ! grep -q 'base/manifest/AndroidManifest.xml' "$WORK/entries.txt"; then
   echo "aab-content-guard: FAIL — no base/manifest/AndroidManifest.xml inside the archive." >&2
   echo "  That file is what makes an .aab an app bundle. What was uploaded is not one." >&2
+  guard_reported=1
   exit 1
 fi
 echo "  ok: base/manifest/AndroidManifest.xml is present (this is an app bundle)"
@@ -115,12 +153,14 @@ if [ -z "$PUBLIC_DIR" ]; then
   echo "  so this usually means 'npx cap sync android' never ran, or ran against a folder" >&2
   echo "  that was not there. Here is what IS under assets/:" >&2
   find "$WORK/x" -type d -path '*/assets*' | head -20 >&2
+  guard_reported=1
   exit 1
 fi
 echo "  ok: web assets found at ${PUBLIC_DIR#"$WORK/x"/}"
 
 if [ ! -f "$PUBLIC_DIR/index.html" ]; then
   echo "aab-content-guard: FAIL — the web assets have no index.html, so the WebView has no page to load." >&2
+  guard_reported=1
   exit 1
 fi
 
@@ -170,6 +210,7 @@ if ! bun "$SCRIPT_DIR/store-edition-check.mjs" "$WORK/x" "$EDITION"; then
   echo "  STORE_PLATFORM=android) so 'bun run store:www' assembles www-store/ for this store," >&2
   echo "  then run 'npx cap sync android' so those files — not an earlier edition's — are the" >&2
   echo "  ones Gradle packs." >&2
+  guard_reported=1
   exit 1
 fi
 
@@ -182,6 +223,7 @@ if [ -n "$EXPECTED_API_BASE" ]; then
     echo "  The app's pages are local files on the app's own origin, so a relative /api/…" >&2
     echo "  call would go to the app itself and the boards, profiles and counters would be" >&2
     echo "  dead inside it while looking healthy in a browser. See src/lib/api-base.ts." >&2
+    guard_reported=1
     exit 1
   fi
 fi
@@ -190,13 +232,35 @@ fi
 # Advisory on purpose: Gradle/AAPT2 may re-encode or rename resource entries inside a
 # bundle, so a byte-level claim here would be a claim this script cannot stand behind.
 # The icon is asserted on the project's own files before the build, which is where it
-# can be checked exactly (see tools/android-icons.py verify).
-icons="$(find "$WORK/x/base/res" -type f -name 'ic_launcher*.png' 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$icons" -ge 15 ]; then
-  echo "  advisory · $icons ic_launcher*.png resource files are in the bundle (15 expected: 5 densities × square/round/foreground)"
+# can be checked exactly (see tools/android-icons.py verify) — that step is what fails
+# a build with a missing launcher icon; this one reports what the finished bundle holds.
+#
+# THIS IS WHERE THE GUARD USED TO GO SILENT (fixed 2026-10-05). `find` exits 1 when the
+# directory it is handed does not exist, and under `set -o pipefail` that ended the whole
+# script on this line — after the last PASS line, before the PASS banner — so a bundle
+# with no base/res/ exited 1 having printed NOTHING. A missing or unreadable input is now
+# a sentence saying so, not an abort; the EXIT trap above is the backstop for the paths
+# nobody has thought of yet.
+RES_DIR="$WORK/x/base/res"
+icons=0
+if [ ! -d "$RES_DIR" ]; then
+  echo "  advisory · NOT CHECKED — there is no base/res/ directory inside this bundle, so the"
+  echo "             launcher-icon check could not run. That is not a pass: confirm the"
+  echo "             'Install the launcher icons' step ran, and read its log before uploading."
+elif [ ! -r "$RES_DIR" ]; then
+  echo "  advisory · NOT CHECKED — base/res/ is inside this bundle but cannot be read, so the"
+  echo "             launcher-icon check could not run. That is not a pass either: confirm the"
+  echo "             'Install the launcher icons' step ran, and read its log before uploading."
 else
-  echo "  advisory · only $icons ic_launcher*.png resource files are in the bundle; 15 were expected."
-  echo "             Read the 'Install the launcher icons' step's log before uploading."
+  icons="$(find "$RES_DIR" -type f -name 'ic_launcher*.png' 2>/dev/null | wc -l || true)"
+  icons="$(printf '%s' "$icons" | tr -cd '0-9')"
+  icons="${icons:-0}"
+  if [ "$icons" -ge 15 ]; then
+    echo "  advisory · $icons ic_launcher*.png resource files are in the bundle (15 expected: 5 densities × square/round/foreground)"
+  else
+    echo "  advisory · only $icons ic_launcher*.png resource files are in the bundle; 15 were expected."
+    echo "             Read the 'Install the launcher icons' step's log before uploading."
+  fi
 fi
 
 if [ "$failed" != 0 ]; then
@@ -211,10 +275,11 @@ aab-content-guard: FAIL — a web purchase surface is inside this Android bundle
   would look at a paid-download checkout steering anyone to an outside payment
   (https://support.google.com/googleplay/android-developer/answer/9858738).
 
-  The usual cause is a `www-store/` (or an assets/public/) left over from an earlier
+  The usual cause is a `www-store/` (or an `assets/public/`) left over from an earlier
   run. Re-run the job so `bun run store:www` rebuilds it from source before Gradle
   packs it.
 MSG
+  guard_reported=1
   exit 1
 fi
 
@@ -227,3 +292,4 @@ if [ "$EDITION" = "android" ]; then
 else
   echo "  and the app's own pages say it is a paid download, as the App Store build requires."
 fi
+guard_reported=1
