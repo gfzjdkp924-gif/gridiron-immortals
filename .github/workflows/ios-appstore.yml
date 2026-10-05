@@ -1,0 +1,757 @@
+# =====================================================================================
+#  Gridiron Immortals — iOS/build & App Store upload, on a GitHub macOS runner
+# =====================================================================================
+#
+#  WHAT THIS IS. One button press turns the code in this repository into an .ipa and
+#  uploads it to App Store Connect. It runs on GitHub's own macOS machine, so nobody on
+#  the team needs a Mac: the runner IS the Mac. The whole job is $0 on a public repo and
+#  roughly $0.62–$1.55 on a private one (macOS runner minutes, 2026-10-05 rates:
+#  https://docs.github.com/en/billing/reference/actions-minute-multipliers).
+#
+#  ===== WHAT MUST EXIST BEFORE THE FIRST RUN (four things, in this order) =============
+#
+#  1. THIS REPOSITORY ON GITHUB, with Actions enabled. Only the owner can do this.
+#
+#  2. FOUR REPOSITORY SECRETS — repo Settings → Secrets and variables → Actions →
+#     "New repository secret". (They may instead be scoped to the GitHub *environment*
+#     named on the job below; see the `environment:` key.) The names are ours, and they
+#     are walked to Apple's field names in the runbook:
+#        ASC_KEY_ID     — the 10-character Key ID of the App Store Connect API key
+#        ASC_ISSUER_ID  — the Issuer ID printed above the key list
+#        ASC_KEY_P8     — the full TEXT of the AuthKey_<KEY_ID>.p8 file, BEGIN/END lines
+#                         included. Apple lets this file be downloaded exactly ONCE.
+#        APPLE_TEAM_ID  — the 10-character Team ID (App Store Connect → Membership).
+#                         This is NOT one of the three key fields and Apple does not put
+#                         it on the key page: automatic signing cannot choose a team
+#                         without it, so the job fails early and says so if it is missing.
+#     The key must be a **Team** key, not an Individual key: Apple's own API-key page says
+#     Individual keys cannot use the provisioning endpoints, and Admin is required to
+#     generate a Team key.
+#     https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api
+#
+#  3. AN APP RECORD in App Store Connect for the bundle id `com.gridironimmortals.game`
+#     (My Apps → + → New App). A build cannot be uploaded to a bundle id that has no app
+#     record yet. Browser job, five minutes, no Mac.
+#     https://developer.apple.com/help/app-store-connect/create-an-app-record/add-a-new-app
+#
+#  4. THE BUNDLE ID REGISTERED to the team in the Apple Developer portal (Certificates,
+#     Identifiers & Profiles → Identifiers). The archive step below asks xcodebuild to
+#     create the distribution certificate and the App Store provisioning profile for it
+#     (`-allowProvisioningUpdates`), but the App ID must belong to the team first.
+#
+#  HOW TO RUN IT. GitHub → this repository → Actions → "iOS App Store build & upload" →
+#  "Run workflow". Roughly 20–35 minutes, most of it the upload. When it finishes, read
+#  the run **Summary** page: it states what was built, whether the .ipa was uploaded, and
+#  the two things that still need doing in App Store Connect afterwards. The .ipa is also
+#  attached to the run as a downloadable artifact, so a failed upload never costs a
+#  rebuild.
+#
+#  ===== THE APP ICON IS HANDLED HERE (it used to be Route A's one real gap) =========
+#  Route A never opens Xcode, so nothing used to install the App Store icon: the app
+#  would have been archived wearing Capacitor's placeholder icon. That is closed in this
+#  file. The 1024×1024 icon now lives INSIDE the repository, at
+#  `wrapper/ios/AppIcon-1024.png` (the same bytes as
+#  `appstore/icons/ios-app-store-1024.png` in the submission package — md5
+#  190b8f014e10cab38c5a8b30da97891e), so a CI checkout can see it; step 6 installs it as
+#  the single 1024 icon in `ios/App/App/Assets.xcassets/AppIcon.appiconset/`, and step 7
+#  asserts, immediately before the archive, that the icon in the Xcode project is ours
+#  rather than Capacitor's placeholder — the job fails loudly if it is not. The icon is
+#  8-bit RGB with no alpha channel, which is what Apple requires; step 6 re-reads that
+#  from the PNG header and flattens the file if it ever arrives with an alpha channel.
+
+#  ===== WHAT IS *NOT* CLAIMED — READ THIS BEFORE TRUSTING THE FILE ====================
+#  Nothing has ever run this workflow, because there is no repository yet. Verified by
+#  hand, on 2026-10-05:
+#    • the YAML parses (command used is in the runbook §Route A)                                
+#    • every flag below is quoted from Apple's or the tool vendor's own documentation, with
+#      the URL beside it; the Transporter flags were read out of Apple's Transporter User
+#      Guide, not remembered.
+#    • every `run:` block passes `bash -n`; shellcheck is clean on all of them except the
+#      run-summary step, whose `${{ … }}` expressions shellcheck cannot parse (that one
+#      warning is expected and pre-existing)
+#    • the icon steps (6 and 7) were run twice in a row against a synthetic `ios/` folder
+#      seeded with Capacitor's own placeholder, and the resulting AppIcon.appiconset is
+#      byte-identical after the second run (idempotent) — and the assertion step fails
+#      when handed the placeholder instead of our icon.
+#  Untested by design (nothing can test them without the repo and the owner's account):
+#  the runner images' exact Xcode/CocoaPods versions, whether `xcrun iTMSTransporter` is
+#  already on the image, whether `npx cap add ios` succeeds on that image, whether
+#  automatic signing mints the certificate on the first try, and the upload itself.
+#  **The icon steps are in that same category: their shell logic was proved on a Linux
+#  box against a synthetic Xcode project, but no real run has ever archived an .ipa with
+#  them, so "Xcode accepts this appiconset" is still a claim about the next run, not a
+#  result.** Expect the first run to be a shakedown run. The runbook's Route A says what
+#  to do with its log.
+# =====================================================================================
+
+name: iOS App Store build & upload
+
+# Manual only. Nothing here runs on a push: an App Store upload should be a decision, and
+# the first run must not happen before the secrets exist.
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: "Version users see (CFBundleShortVersionString)"
+        required: false
+        default: "1.0.0"
+      skip_upload:
+        description: "Build the .ipa only — do not upload to App Store Connect"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Two uploads racing for the same build number is a guaranteed rejection, so never cancel
+# one in favour of the other.
+concurrency:
+  group: ios-appstore
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    # GitHub-hosted macOS runners, labels from
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+    # macos-15 = macOS 15, Xcode 16.x, arm64. macos-14 works the same if macos-15 is ever
+    # unavailable. Use `macos-15-intel` only if a dependency turns out to be x86-only.
+    runs-on: macos-15
+    timeout-minutes: 60
+    # Optional, and free: the four secrets may live here (Settings → Environments →
+    # app-store-connect) instead of being readable by every workflow in the repository.
+    # Nothing below requires the environment to be pre-created with any settings.
+    environment: app-store-connect
+
+    env:
+      # Reference name used everywhere below; never printed.
+      KEY_FILE: ${{ github.workspace }}/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8
+
+    steps:
+      # ---------------------------------------------------------------------------------
+      # 1. Get the code, and the two toolchains the build needs.
+      # ---------------------------------------------------------------------------------
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Everything below uses paths relative to the repository root, so the root has to
+      # BE the website project folder. Cheap to check, and it turns the single most
+      # confusing possible first-run failure ("Cannot find module package.json") into one
+      # plain sentence.
+      - name: Check the repository root is the website project
+        run: |
+          set -euo pipefail
+          for f in package.json capacitor.config.ts tools/store-build-check.mjs wrapper/ios/PrivacyInfo.xcprivacy wrapper/ios/AppIcon-1024.png; do
+            test -f "$f" || {
+              echo "::error::$f is missing at the repository root. This workflow expects the repository root to be the website project folder itself (the one holding package.json and capacitor.config.ts) — not a parent folder that contains it."
+              exit 1
+            }
+          done
+          echo "repository root looks right: package.json, capacitor.config.ts, the store guard, the privacy manifest and the App Store icon are all here"
+
+      # Bun is how this project is built locally (bun.lock is in the repo).
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Node + npx, because the Capacitor CLI (`npx cap …`) is what generates the Xcode
+      # project. Node 22 is the current LTS.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      # ---------------------------------------------------------------------------------
+      # 2. Rebuild the paid app's web bundle FROM SOURCE, with the guard on.
+      #    `bun run store:www:ios` == the guarded store build (`bun run build:store:ios`, whose
+      #    STORE_BUILD=1 lives inside package.json — never typed here) PLUS assembling
+      #    www-store/ and checking that the bundle addresses the API absolutely.
+      #    THE EDITION IS ON THE COMMAND, NOT IN THIS FILE. There are two editions of this
+      #    app (App Store = paid, Play = free) and `bun run store:www` is REFUSED on purpose:
+      #    tools/make-store-www.sh exits 2 rather than guess, because a paid App Store
+      #    download labelled "free" (or the reverse) is a false statement to a reviewer.
+      #    `store:www:ios` is what sets STORE_PLATFORM=ios (in package.json, next to
+      #    STORE_BUILD=1) so the paid edition's sentences are the ones bundled.
+      #    `bun run build:store:ios` alone would leave the CHECKED-IN www-store/ in place,
+      #    which is exactly the folder this workflow must not trust.
+      #    The guard is tools/store-build-check.mjs: if the bundle still contains the
+      #    payment link, the /unlock route, "first run free" or the $4.99 price, the
+      #    script exits non-zero and THIS JOB FAILS. Apple's rule that makes it necessary:
+      #    https://developer.apple.com/app-store/review/guidelines/ (3.1.1 — a paid
+      #    download must not steer anyone to an outside purchase).
+      # ---------------------------------------------------------------------------------
+      - name: Rebuild the store wrapper, guarded (fails the job on any purchase surface)
+        run: bun run store:www:ios
+
+      # ---------------------------------------------------------------------------------
+      # 3. Native toolchain.
+      #    CocoaPods is what `npx cap add/sync ios` uses to install the iOS platform's
+      #    pods. It is on the current macOS runner images, but check rather than assume.
+      #    (`brew` needs no password on GitHub's runners — passwordless sudo is
+      #    documented for them:
+      #    https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+      # ---------------------------------------------------------------------------------
+      - name: Install CocoaPods if the image does not already have it
+        run: |
+          if command -v pod >/dev/null 2>&1; then
+            echo "CocoaPods already present: $(pod --version)"
+          else
+            echo "CocoaPods missing — installing with Homebrew"
+            brew install cocoapods
+            pod --version
+          fi
+
+      # ---------------------------------------------------------------------------------
+      # 4. The Xcode project: CREATE IT the first time, SYNC IT afterwards.
+      #    WHICH BRANCH THIS TAKES ON THE FIRST RUN: `ios/` is NOT in the repository
+      #    today, so the first run takes the `cap add ios` branch and creates the Xcode
+      #    project on the runner. Every run after that (once the generated project is
+      #    committed) takes the `cap sync ios` branch. Both branches are handled here and
+      #    the choice is printed in the log, so there is no ambiguity about which ran.
+      #    The Capacitor packages (`@capacitor/cli`, `@capacitor/core`, `@capacitor/ios`)
+      #    are PINNED EXACT at 8.5.2 in package.json — cli as a dev dependency, core and ios
+      #    as dependencies, which is where Capacitor's own project layout puts them. So the
+      #    `bun install --frozen-lockfile` step above already installed exactly the versions
+      #    this wrapper is built and tested against, and nothing is added to the checkout
+      #    here any more (it used to run `bun add`, which floated to whatever was latest that
+      #    morning). 8.5.2 was the version the unpinned install resolved to on 2026-10-05
+      #    (it is the `latest` dist-tag; the previous major line is 6.x), so pinning it
+      #    changes nothing about what a Route A build installs — it only stops that answer
+      #    from moving under us. `npx cap` below resolves the pinned local binary.
+      #    Capacitor's own iOS documentation: https://capacitorjs.com/docs/ios
+      # ---------------------------------------------------------------------------------
+      - name: Add the iOS project, or sync the existing one
+        run: |
+          set -euo pipefail
+          npx cap --version
+          if [ -d ios ]; then
+            echo "BRANCH: ios/ exists in the repository → npx cap sync ios"
+            npx cap sync ios
+          else
+            echo "BRANCH: ios/ does not exist → npx cap add ios (creating the Xcode project)"
+            npx cap add ios
+            npx cap sync ios
+          fi
+
+      # ---------------------------------------------------------------------------------
+      # 5. Apple's privacy manifest must be INSIDE the app bundle, not just in the repo.
+      #    Capacitor's recent iOS templates already ship an App/App/PrivacyInfo.xcprivacy
+      #    that is part of the App target, so copying ours over it is enough; on an older
+      #    template the file is new and has to be added to the target, which the
+      #    xcodeproj Ruby gem (installed as a CocoaPods dependency) can do. Best-effort:
+      #    a failure here does not stop the build, and the .ipa check in step 10 reports
+      #    whether the manifest actually made it in. Apple:
+      #    https://developer.apple.com/documentation/bundleresources/privacy-manifest-files
+      # ---------------------------------------------------------------------------------
+      - name: Install the privacy manifest into the Xcode project
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cp wrapper/ios/PrivacyInfo.xcprivacy ios/App/App/PrivacyInfo.xcprivacy
+          ruby -e '
+            require "xcodeproj"
+            proj = Xcodeproj::Project.open("ios/App/App.xcodeproj")
+            target = proj.targets.find { |t| t.name == "App" } or abort("no App target")
+            app_group = proj.main_group.find_subpath("App", true)
+            if target.resources_build_phase.files_references.any? { |r| r.path == "PrivacyInfo.xcprivacy" }
+              puts "PrivacyInfo.xcprivacy is already a resource of the App target"
+            else
+              ref = app_group.files.find { |f| f.path == "PrivacyInfo.xcprivacy" } ||
+                    app_group.new_reference("PrivacyInfo.xcprivacy")
+              target.add_resources([ref])
+              proj.save
+              puts "added PrivacyInfo.xcprivacy to the App target"
+            end
+          '
+
+      # ---------------------------------------------------------------------------------
+      # 6. THE APP ICON. Capacitor's iOS template ships its own placeholder in
+      #    `ios/App/App/Assets.xcassets/AppIcon.appiconset/` (today that is a single
+      #    `AppIcon-512@2x.png` holding the Capacitor logo; older templates ship a whole
+      #    ladder of sizes). Under Route A nobody opens Xcode, so without this step the app
+      #    would go to review wearing Capacitor's icon. The fix is that OUR icon now lives
+      #    inside the repository at `wrapper/ios/AppIcon-1024.png` — the same bytes as
+      #    `appstore/icons/ios-app-store-1024.png` in the submission package — so a CI
+      #    checkout can reach it.
+      #
+      #    Modern Xcode (14 and later) wants ONE 1024×1024 icon for iOS: a single
+      #    `universal` / `platform: ios` / `1024x1024` entry in Contents.json. So the
+      #    install is: clear every .png Capacitor put in that appiconset, copy ours in as
+      #    `AppIcon-1024.png`, and write Contents.json from scratch.
+      #
+      #    IDEMPOTENT BY CONSTRUCTION — running this twice changes nothing. Every command
+      #    either overwrites a file with identical bytes (the PNG is a byte copy of the
+      #    source; Contents.json is derived, never patched) or deletes a file that should
+      #    not be there, and both are done on every run rather than only when something is
+      #    missing. No step here appends, merges or edits an existing JSON file.
+      #
+      #    ALPHA — the reason this is checked rather than assumed: Apple rejects an app icon
+      #    that carries an alpha channel, and that rejection comes at review time (a wasted
+      #    cycle), not as a build error. Apple's rule is in the App Store Connect icon
+      #    requirements; the appiconset below is the only icon that reaches the archive.
+      #    OUR FILE IS ALREADY FLAT: 1024×1024, 8-bit RGB, PNG colour type 2, no tRNS chunk
+      #    (read out of the file's own IHDR bytes; same finding as
+      #    `appstore/icons/README.md`). The branch below therefore does not run today — it
+      #    is here so that replacing the artwork later cannot quietly reintroduce alpha:
+      #    the header is re-read on every run and an RGBA icon is flattened onto the game's
+      #    own dark background (`#070c17`) before it is copied in. When that branch does run,
+      #    the installed file is deliberately NOT byte-identical to the source. ImageMagick
+      #    is NOT on GitHub's macOS images (checked against the image's own manifest, which
+      #    has Homebrew but no imagemagick), so that branch would `brew install` it first —
+      #    about a minute, and only in that branch. **That branch has never run for real**,
+      #    which is part of the header's honest caveat.
+      # ---------------------------------------------------------------------------------
+      - name: Install the App Store icon into the Xcode project
+        run: |
+          set -euo pipefail
+          ICON_SRC=wrapper/ios/AppIcon-1024.png
+          ICON_NAME=AppIcon-1024.png
+          APPICONSET=ios/App/App/Assets.xcassets/AppIcon.appiconset
+
+          # Read the PNG's own header: width, height, bit depth, colour type, and whether
+          # an alpha channel is present (colour type 4 = grey+alpha, 6 = RGB+alpha) or a
+          # tRNS chunk is (a palette/truecolour transparency chunk). Prints 5 fields.
+          pnginfo() {
+            python3 - "$1" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read()
+          if data[:8] != b"\x89PNG\r\n\x1a\n":
+              sys.exit(f"{sys.argv[1]} is not a PNG")
+          w, h, depth, ctype = struct.unpack(">IIBB", data[16:26])
+          i, trns = 8, False
+          while i + 8 <= len(data):
+              ln = struct.unpack(">I", data[i:i + 4])[0]
+              typ = data[i + 4:i + 8]
+              if typ == b"tRNS":
+                  trns = True
+              if typ == b"IEND":
+                  break
+              i += 12 + ln
+          print(w, h, depth, ctype, 1 if (ctype in (4, 6) or trns) else 0)
+          PY
+          }
+
+          test -f "$ICON_SRC" || {
+            echo "::error::$ICON_SRC is missing. The App Store icon is checked into the repository on purpose (see the header of this workflow); without it this build would ship Capacitor's placeholder icon."
+            exit 1
+          }
+          INFO="$(pnginfo "$ICON_SRC")" || {
+            echo "::error::could not read the PNG header of $ICON_SRC (is it a real PNG, or a Git LFS pointer?)"
+            exit 1
+          }
+          read -r W H DEPTH CT ALPHA <<<"$INFO"
+          echo "icon source: $ICON_SRC — ${W}x${H}, bit depth $DEPTH, colour type $CT, alpha=$ALPHA"
+          if [ "$W" != "1024" ] || [ "$H" != "1024" ]; then
+            echo "::error::the App Store icon must be 1024x1024; $ICON_SRC is ${W}x${H}. The App Store's own icon requirements want exactly 1024x1024."
+            exit 1
+          fi
+
+          if [ "$ALPHA" != "0" ]; then
+            echo "::warning::$ICON_SRC carries an alpha channel (PNG colour type $CT) — Apple rejects app icons with alpha, so flattening it onto #070c17 with ImageMagick before it goes in."
+            FLATTEN=""
+            for tool in magick convert; do
+              if command -v "$tool" >/dev/null 2>&1; then FLATTEN="$tool"; break; fi
+            done
+            if [ -z "$FLATTEN" ]; then
+              echo "no ImageMagick on this runner image — installing it"
+              brew install imagemagick
+              FLATTEN=magick
+            fi
+            # png24: forces 24-bit RGB output, i.e. no alpha channel at all.
+            "$FLATTEN" "$ICON_SRC" -background "#070c17" -alpha remove -alpha off "png24:$RUNNER_TEMP/AppIcon-1024-rgb.png"
+            ICON_SRC="$RUNNER_TEMP/AppIcon-1024-rgb.png"
+            read -r W H DEPTH CT ALPHA <<<"$(pnginfo "$ICON_SRC")"
+            echo "flattened icon: ${W}x${H}, bit depth $DEPTH, colour type $CT, alpha=$ALPHA"
+            if [ "$ALPHA" != "0" ] || [ "$W" != "1024" ] || [ "$H" != "1024" ]; then
+              echo "::error::the flatten step did not produce a 1024x1024 RGB icon (colour type $CT) — stopping rather than archiving an icon Apple will reject."
+              exit 1
+            fi
+          fi
+
+          mkdir -p "$APPICONSET"
+          # Remove EVERY png in the appiconset first. Whatever Capacitor's template called
+          # its placeholder (AppIcon-512@2x.png on current templates, a full ladder of sizes
+          # on older ones), a leftover file referenced by Contents.json is exactly how a
+          # placeholder survives a replacement. Nothing of ours is lost: ours is copied in
+          # from the repository on the next line, every run.
+          find "$APPICONSET" -maxdepth 1 -name '*.png' -delete
+          cp "$ICON_SRC" "$APPICONSET/$ICON_NAME"
+          # Derived, never edited in place — this heredoc ends with the same bytes every run.
+          cat > "$APPICONSET/Contents.json" <<JSON
+          {
+            "images" : [
+              {
+                "filename" : "$ICON_NAME",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          JSON
+          echo "installed the app icon:"
+          ls -l "$APPICONSET"
+          md5sum "$ICON_SRC" "$APPICONSET/$ICON_NAME" 2>/dev/null || md5 "$ICON_SRC" "$APPICONSET/$ICON_NAME"
+
+      # ---------------------------------------------------------------------------------
+      # 7. PRE-ARCHIVE ASSERTION — the gate that makes "the app cannot ship with Capacitor's
+      #    placeholder icon" a checked fact instead of a hope. It looks at the FILES in the
+      #    Xcode project, not at step 6's exit code: a step can succeed and still leave a
+      #    placeholder in place (a template that names its file differently, a Contents.json
+      #    that still points at the Capacitor file, an empty appiconset, an image that lost
+      #    its alpha in a later build). Any of those fails the job here — loudly, with
+      #    ::error:: — while a rebuild is still cheap, instead of at review.
+      #
+      #    What it proves, in order: the icon we ship from is the file we think it is; the
+      #    file inside the Xcode project is byte-identical to it; that file is the ONLY
+      #    image in the appiconset; Contents.json names our file, and only our file, for the
+      #    1024 iOS slot; and the installed PNG has no alpha channel.
+      # ---------------------------------------------------------------------------------
+      - name: Assert the app icon is ours, not Capacitor's placeholder
+        run: |
+          set -euo pipefail
+          ICON_SRC=wrapper/ios/AppIcon-1024.png
+          ICON_NAME=AppIcon-1024.png
+          APPICONSET=ios/App/App/Assets.xcassets/AppIcon.appiconset
+          # The md5 of `appstore/icons/ios-app-store-1024.png`, i.e. of the artwork the
+          # submission package ships. Compared, not assumed: this is what catches a replaced
+          # or truncated file (including a Git LFS pointer, which is a few hundred bytes of
+          # text and would silently become the app's icon).
+          EXPECTED_MD5=190b8f014e10cab38c5a8b30da97891e
+
+          file_md5() {
+            if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi
+          }
+
+          src_md5="$(file_md5 "$ICON_SRC")"
+          if [ "$src_md5" != "$EXPECTED_MD5" ]; then
+            echo "::error::$ICON_SRC is not the icon this build is supposed to ship (md5 $src_md5, expected $EXPECTED_MD5). Either the artwork was replaced without updating this assertion, or the file is not the PNG it claims to be. Stopping before the archive."
+            exit 1
+          fi
+
+          # No `|| true` here: a missing appiconset or a missing png is itself the failure.
+          find "$APPICONSET" -maxdepth 1 -type f | while read -r f; do echo "appiconset: $f"; done
+          installed="$(find "$APPICONSET" -maxdepth 1 -name '*.png' | sort)"
+          count="$(printf '%s\n' "$installed" | grep -c . || true)"
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly one png in $APPICONSET, found $count: $installed. Capacitor's placeholder is still in the icon set — a build from this state would ship the wrong icon. Read the 'Install the App Store icon' step's log."
+            exit 1
+          fi
+          if [ "$installed" != "$APPICONSET/$ICON_NAME" ]; then
+            echo "::error::$APPICONSET holds $installed, not $ICON_NAME. That is Capacitor's placeholder icon, not ours."
+            exit 1
+          fi
+
+          inst_md5="$(file_md5 "$installed")"
+          if [ "$inst_md5" != "$EXPECTED_MD5" ]; then
+            echo "::error::the icon inside the Xcode project ($installed, md5 $inst_md5) is not our icon (md5 $EXPECTED_MD5) — this is exactly the Capacitor placeholder getting through. Stopping before the archive."
+            exit 1
+          fi
+
+          # Contents.json must name OUR file and nothing else, in the one slot modern Xcode
+          # reads. Parsed as JSON rather than grepped, so a stale ladder of entries or a
+          # filename in a comment cannot pass.
+          python3 - "$APPICONSET/Contents.json" "$ICON_NAME" <<'PY'
+          import json, sys
+          path, want = sys.argv[1], sys.argv[2]
+          try:
+              doc = json.load(open(path))
+          except Exception as exc:
+              sys.exit(f"::error:: {path} is not valid JSON ({exc}) — it must be the single-icon Contents.json this workflow writes.")
+          images = doc.get("images")
+          if not isinstance(images, list) or len(images) != 1:
+              sys.exit(f"::error:: {path} must describe exactly ONE image (the modern single-1024 icon); it describes {images!r}. Capacitor's multi-size ladder is still in place.")
+          entry = images[0]
+          if entry.get("filename") != want:
+              sys.exit(f"::error:: {path} names {entry.get('filename')!r} as the app icon, not {want!r} — that is Capacitor's placeholder icon.")
+          if entry.get("size") != "1024x1024" or entry.get("idiom") != "universal" or entry.get("platform") != "ios":
+              sys.exit(f"::error:: {path}'s image entry is {entry!r}; it must be the universal/ios/1024x1024 entry modern Xcode expects for a single-size app icon.")
+          print(f"Contents.json ok: one image, {want}, universal/ios/1024x1024")
+          PY
+
+          # Alpha, one last time, on the file that is actually in the project (not on the
+          # source it was copied from). Apple rejects an icon with an alpha channel.
+          read -r W H DEPTH CT ALPHA <<<"$(python3 - "$installed" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read()
+          w, h, depth, ctype = struct.unpack(">IIBB", data[16:26])
+          i, trns = 8, False
+          while i + 8 <= len(data):
+              ln = struct.unpack(">I", data[i:i + 4])[0]
+              typ = data[i + 4:i + 8]
+              if typ == b"tRNS":
+                  trns = True
+              if typ == b"IEND":
+                  break
+              i += 12 + ln
+          print(w, h, depth, ctype, 1 if (ctype in (4, 6) or trns) else 0)
+          PY
+          )"
+          echo "app icon in the project: ${W}x${H}, bit depth $DEPTH, colour type $CT, alpha=$ALPHA"
+          if [ "$W" != "1024" ] || [ "$H" != "1024" ] || [ "$ALPHA" != "0" ]; then
+            echo "::error::the app icon in the Xcode project is ${W}x${H} colour type $CT alpha=$ALPHA; App Store icons must be 1024x1024 with no alpha channel. Stopping before the archive."
+            exit 1
+          fi
+          echo "app icon CHECK PASSED: $ICON_NAME is ours (md5 $inst_md5), it is the only image in the appiconset, Contents.json points at it, and it carries no alpha channel."
+
+      # ---------------------------------------------------------------------------------
+      # 8. Write the API key where Apple's own tools look for it.
+      #    The filename is not free-form: Apple's Transporter User Guide says the private
+      #    key must be called AuthKey_<apiKey value>.p8, and it searches
+      #    <cwd>/private_keys, <home>/private_keys, <home>/.private_keys and
+      #    <home>/.appstoreconnect/private_keys in that order.
+      #    https://help.apple.com/itc/transporteruserguide/en.lproj/apdAa073cb45.html
+      #    We use <workspace>/private_keys — the first path searched, and one GitHub
+      #    ignores in a run's artifact upload context. `xcodebuild` gets the same file by
+      #    explicit path below.
+      #    The content is never echoed: only a shape check and a byte count.
+      # ---------------------------------------------------------------------------------
+      - name: Write the App Store Connect API key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p private_keys
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          if ! grep -q 'BEGIN PRIVATE KEY' "$KEY_FILE"; then
+            echo "::error::ASC_KEY_P8 does not look like a .p8 private key (no 'BEGIN PRIVATE KEY' line). Paste the entire file, including the BEGIN and END lines, as a multi-line secret."
+            exit 1
+          fi
+          echo "wrote $KEY_FILE ($(wc -c < "$KEY_FILE" | tr -d ' ') bytes, permissions $(stat -f '%Lp' "$KEY_FILE"))"
+
+      # Fail fast on the missing-secret class of mistake: a run that dies at the archive
+      # step after 10 minutes is much harder to read than one that dies here.
+      - name: Preflight — required secrets and the Xcode workspace
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in ASC_KEY_ID ASC_ISSUER_ID APPLE_TEAM_ID; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing — see the comments at the top of this workflow for what each one is and where Apple displays it."
+            exit 1
+          fi
+          xcodebuild -version
+          test -d ios/App/App.xcworkspace || { echo "::error::ios/App/App.xcworkspace is missing — 'npx cap add/sync ios' did not finish. Read that step's log."; exit 1; }
+          echo "preflight ok: Xcode and the workspace are in place"
+
+      # ---------------------------------------------------------------------------------
+      # 9. Archive + export. Every flag that is not obvious is quoted from Apple:
+      #
+      #  -allowProvisioningUpdates      "Allow xcodebuild to communicate with the Apple
+      #                                  Developer website… xcodebuild will create and
+      #                                  update profiles, app IDs, and certificates."
+      #  -authenticationKeyPath/-ID/-IssuerID   authenticate to Apple with the App Store
+      #                                  Connect API key instead of an Apple ID in Xcode's
+      #                                  Accounts pane (no password, no 2FA on the runner).
+      #  Both from Apple's xcodebuild(1) man page; the man page ships only on macOS, so
+      #  this is the community mirror of Apple's text and the runbook flags it as
+      #  second-hand: https://keith.github.io/xcode-man-pages/xcodebuild.1.html
+      #  Apple's own description of the mechanism (cloud-managed signing certificates):
+      #      https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases
+      #  The API-key-only alternative, if automatic signing ever refuses: mint the
+      #  certificate and profile yourself with POST /v1/certificates and POST /v1/profiles
+      #  (both documented, both usable with this same key):
+      #      https://developer.apple.com/documentation/appstoreconnectapi/certificates
+      #      https://developer.apple.com/documentation/appstoreconnectapi/profiles
+      #
+      #  Version/build numbers are forced from the outside so a re-run can never collide
+      #  with an already-uploaded build number (Apple rejects a repeated one). The build
+      #  number is the workflow run number, which only ever goes up.
+      # ---------------------------------------------------------------------------------
+      - name: Archive for App Store distribution
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MARKETING_VERSION: ${{ inputs.marketing_version }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -allowProvisioningDeviceRegistration \
+            -authenticationKeyPath "$KEY_FILE" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          echo "archived: $RUNNER_TEMP/App.xcarchive ($(du -sh "$RUNNER_TEMP/App.xcarchive" | cut -f1))"
+
+      # `method` below is the export method name for App Store Connect distribution.
+      # Xcode 15.3 and later accept `app-store-connect`; Xcode 15.0–15.2 call the same
+      # thing `app-store` and reject the newer spelling, so if this step ever fails with
+      # "unrecognized method", that is the one word to change. The accepted values are
+      # listed by `xcodebuild -help` on the runner itself, and the distribution path this
+      # implements is Apple's:
+      # https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases
+      # The `-exportArchive` upload shortcut is deliberately NOT used: Apple's own man page
+      # says that upload path wants "an Apple ID account belonging to the archive's
+      # development team … Enter the credentials for the Apple ID account using Xcode's
+      # Accounts preference pane" — which is the one thing we cannot do without a Mac or a
+      # password. So the archive is exported to an .ipa here and uploaded in the next step.
+      - name: Export the .ipa
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_FILE" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -l "$RUNNER_TEMP/export"
+
+      # ---------------------------------------------------------------------------------
+      # 10. Upload. Apple's own upload page names the API-key-native tool: "If you use the
+      #    App Store Connect API, you might want to upload your binary using the
+      #    Transporter command-line tool and JSON Web Tokens (JWTs) for authentication."
+      #    https://developer.apple.com/help/app-store-connect/manage-builds/upload-builds
+      #    -apiKey/-apiIssuer IS that JWT path: Apple's Transporter User Guide says the
+      #    pair makes Transporter find AuthKey_<key id>.p8 and sign the token itself, and
+      #    that `-jwt <token>` (a token you sign yourself) can be used in its place:
+      #    https://help.apple.com/itc/transporteruserguide/en.lproj/apdAa073cb45.html
+      #    Secret names: Transporter calls these API Key and Issuer ID — i.e. exactly our
+      #    ASC_KEY_ID / ASC_ISSUER_ID, no renaming needed. (fastlane, if we ever switch,
+      #    wants them as `api_key`/`api_key_path` — a different mechanism, not this one.)
+      #    Note: `altool` is NOT retired for App Store uploads — Apple retired it for
+      #    NOTARIZATION only (TN3147) — so it is a legitimate fallback if the runner
+      #    image has no Transporter binary, and it takes the same two flags.
+      #    https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool
+      #    One more documented alternative, if Transporter and altool both go away:
+      #    the App Store Connect API's own build-upload endpoint, POST /v1/buildUploads
+      #    (Apple's upload page: "You can upload your app binary with the App Store
+      #    Connect API"):
+      #    https://developer.apple.com/documentation/appstoreconnectapi/post-v1-builduploads
+      # ---------------------------------------------------------------------------------
+      - name: Upload the .ipa to App Store Connect
+        if: ${{ !inputs.skip_upload }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          set -- "$RUNNER_TEMP"/export/*.ipa
+          IPA="$1"
+          echo "uploading $(basename "$IPA") ($(du -h "$IPA" | cut -f1))"
+
+          # The privacy manifest has to be inside the app bundle, and step 5 is
+          # best-effort, so check the finished .ipa rather than assuming. A warning, not a
+          # failure: an .ipa without the manifest can still be uploaded, and this is the
+          # one thing worth knowing before the submission rather than after it.
+          if unzip -l "$IPA" | grep -q 'PrivacyInfo.xcprivacy'; then
+            echo "privacy manifest: present inside the .ipa"
+          else
+            echo "::warning::this .ipa contains no PrivacyInfo.xcprivacy — the manifest step did not get the file into the App target. Fix before submitting: commit the generated ios/ folder with the file added to the App target, or read the comment on step 5. Apple: https://developer.apple.com/documentation/bundleresources/privacy-manifest-files"
+          fi
+
+          # Transporter ships WITH Xcode for app developers ("you can use Transporter if
+          # you already have Xcode"), so try the toolchain path first, then the installer
+          # location from Apple's install page, then the app bundle. Print which was used.
+          TRANSPORTER=""
+          if xcrun --find iTMSTransporter >/dev/null 2>&1; then
+            TRANSPORTER="$(xcrun --find iTMSTransporter)"
+          elif [ -x /usr/local/itms/bin/iTMSTransporter ]; then
+            TRANSPORTER=/usr/local/itms/bin/iTMSTransporter
+          elif [ -x /Applications/Transporter.app/Contents/itms/bin/iTMSTransporter ]; then
+            TRANSPORTER=/Applications/Transporter.app/Contents/itms/bin/iTMSTransporter
+          fi
+
+          if [ -n "$TRANSPORTER" ]; then
+            echo "using Transporter at $TRANSPORTER"
+            "$TRANSPORTER" -m upload \
+              -apiKey "$ASC_KEY_ID" \
+              -apiIssuer "$ASC_ISSUER_ID" \
+              -assetFile "$IPA" \
+              -v informational
+            echo "TRANSPORTER UPLOAD RESULT: exit 0 — App Store Connect accepted the transfer (the build then processes for a few minutes before it appears in App Store Connect)"
+          else
+            echo "::warning::no Transporter binary on this runner image — falling back to altool, which Apple still supports for App Store uploads (retired for notarization only): https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool"
+            xcrun altool --upload-app --type ios --file "$IPA" \
+              --apiKey "$ASC_KEY_ID" \
+              --apiIssuer "$ASC_ISSUER_ID"
+            echo "ALTOOL UPLOAD RESULT: exit 0 — App Store Connect accepted the transfer"
+          fi
+
+      # Keep the built app even when the upload step failed: a failed upload should not
+      # cost another build, and the artifact is the evidence of what was produced.
+      - name: Keep the .ipa as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-and-archive-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: warn
+          retention-days: 14
+
+      # The one-page result, for someone who should not have to read the whole log.
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## iOS build run"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version / build | \`${{ inputs.marketing_version }} (${{ github.run_number }})\` |"
+            if ls "$RUNNER_TEMP"/export/*.ipa >/dev/null 2>&1; then
+              echo "| .ipa | built — $(du -h "$RUNNER_TEMP"/export/*.ipa | cut -f1); also attached to this run as a download |"
+            else
+              echo "| .ipa | **not built** — read the Export step's log above |"
+            fi
+            if [ "${{ inputs.skip_upload }}" = "true" ]; then
+              echo "| Upload | skipped (the run was started with \`skip_upload\` on) |"
+            else
+              echo "| Upload | see the Upload step above; the last RESULT line is the answer |"
+            fi
+            echo ""
+            echo "### Still to do in App Store Connect (nothing to do with this run)"
+            echo ""
+            echo "1. **Export compliance.** The build arrives marked *Missing Compliance*. Answer yes it uses"
+            echo "   encryption → *limited to HTTPS / the OS's own*. Until then it cannot be selected for review."
+            echo "2. **Screenshots, listing and price**, from \`appstore/metadata.md\` and"
+            echo "   \`appstore/submit-checklist.md\`, then **Submit for Review**."
+            echo ""
+            echo "_Route A of the submission package. If this run failed, the one-page fallback is"
+            echo "\"Route B — rented Mac\" in \`appstore/store-build-runbook.md\`._"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Gridiron Immortals">
+  <title>Gridiron Immortals</title>
+  <!--
+    Hand-drawn app icon. Everything that matters sits inside the central 80%
+    circle (r <= 204.8 about the centre), so the same artwork survives an
+    Android/maskable crop and the iOS home-screen squircle. The background is
+    full-bleed and opaque on purpose: iOS composites a transparent
+    apple-touch-icon onto black.
+  -->
+  <defs>
+    <radialGradient id="gi-bg" cx="50%" cy="36%" r="80%">
+      <stop offset="0%" stop-color="#1a2a4c"/>
+      <stop offset="55%" stop-color="#0d1730"/>
+      <stop offset="100%" stop-color="#070c17"/>
+    </radialGradient>
+    <linearGradient id="gi-ball" x1="0.15" y1="0" x2="0.75" y2="1">
+      <stop offset="0%" stop-color="#ffe49a"/>
+      <stop offset="45%" stop-color="#f5c451"/>
+      <stop offset="100%" stop-color="#c08e18"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#gi-bg)"/>
+
+  <g transform="translate(256 256) rotate(-20)">
+    <circle r="196" fill="none" stroke="#f5c451" stroke-opacity="0.2" stroke-width="9"/>
+    <path
+      d="M -150 0 C -92 -112 92 -112 150 0 C 92 112 -92 112 -150 0 Z"
+      fill="url(#gi-ball)"
+      stroke="#7d5a10"
+      stroke-width="7"
+      stroke-linejoin="round"/>
+    <rect x="-54" y="-7" width="108" height="14" rx="7" fill="#f8fafc"/>
+    <g fill="#f8fafc">
+      <rect x="-40" y="-23" width="9" height="46" rx="4.5"/>
+      <rect x="-20" y="-23" width="9" height="46" rx="4.5"/>
+      <rect x="0" y="-23" width="9" height="46" rx="4.5"/>
+      <rect x="20" y="-23" width="9" height="46" rx="4.5"/>
+      <rect x="40" y="-23" width="9" height="46" rx="4.5"/>
+    </g>
+  </g>
+</svg>

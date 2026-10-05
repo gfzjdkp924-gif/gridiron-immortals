@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+@layer base {
+  html {
+    color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: #070c17;
+    color: #f1f5f9;
+    -webkit-font-smoothing: antialiased;
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+      sans-serif;
+    /* Broadcast-scoreboard numerals for ratings and records. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  button {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  ::selection {
+    background: #f5c451;
+    color: #0a1020;
+  }
+}

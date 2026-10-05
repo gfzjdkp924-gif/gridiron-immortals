@@ -1,0 +1,160 @@
+<!doctype html>
+<!--
+  Gridiron Immortals — the source of public/og-image.png (1200×630), the picture
+  a chat app or social site shows when someone pastes the game's address.
+
+  It is a static file, not a route: link crawlers do not run JavaScript and will
+  not wait for a canvas. To regenerate after a copy or colour change:
+
+    agent-browser open file://<abs path>/tools/og-image.html
+    agent-browser set viewport 1200 630 1
+    agent-browser screenshot /home/team/shared/site/public/og-image.png
+
+  Every word on it has to stay true of the shipped game: no scores, no player
+  names, no promise of a price or a download that does not exist yet. The
+  address is the canonical one from src/lib/site.ts.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gridiron Immortals — link preview</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+      }
+      body {
+        background: #070c17;
+        color: #f8fafc;
+        font-family:
+          ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      .card {
+        position: relative;
+        width: 1200px;
+        height: 630px;
+        padding: 64px 72px;
+        background:
+          radial-gradient(760px 420px at 18% 8%, rgba(245, 196, 81, 0.16), rgba(245, 196, 81, 0)),
+          linear-gradient(160deg, #13203d 0%, #0b1428 55%, #070c17 100%);
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .brand {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+      }
+      .wordmark {
+        font-size: 54px;
+        font-weight: 900;
+        letter-spacing: -0.02em;
+        text-transform: uppercase;
+        line-height: 1;
+      }
+      .wordmark span {
+        color: #f5c451;
+      }
+      .kicker {
+        font-size: 20px;
+        font-weight: 700;
+        letter-spacing: 0.22em;
+        text-transform: uppercase;
+        color: #94a3b8;
+      }
+      h1 {
+        font-size: 82px;
+        font-weight: 900;
+        line-height: 1.02;
+        letter-spacing: -0.02em;
+        margin-top: 10px;
+      }
+      h1 em {
+        font-style: normal;
+        color: #f5c451;
+      }
+      .strip {
+        display: flex;
+        gap: 16px;
+        margin-top: 34px;
+      }
+      .step {
+        flex: 1;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        padding: 14px 18px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+      .step b {
+        display: block;
+        font-size: 22px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+      .step i {
+        font-style: normal;
+        font-size: 17px;
+        color: #94a3b8;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border: 1px solid rgba(245, 196, 81, 0.32);
+        background: rgba(245, 196, 81, 0.1);
+        border-radius: 20px;
+        padding: 20px 26px;
+      }
+      .url {
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        color: #f5c451;
+      }
+      .note {
+        font-size: 18px;
+        color: #cbd5e1;
+        text-align: right;
+        max-width: 420px;
+        line-height: 1.35;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div>
+        <div class="brand">
+          <p class="wordmark">Gridiron <span>Immortals</span></p>
+          <p class="kicker mono">All-time draft</p>
+        </div>
+        <h1>Spin a team + decade.<br />Draft its legends. <em>Chase 17–0.</em></h1>
+        <div class="strip mono">
+          <div class="step"><b>Spin</b><i>team + decade</i></div>
+          <div class="step"><b>Draft</b><i>11 positions</i></div>
+          <div class="step"><b>Play</b><i>17 games</i></div>
+        </div>
+      </div>
+      <div class="foot">
+        <p class="url mono">www.gridironimmortals.com</p>
+        <p class="note">
+          Not affiliated with the NFL or any of its clubs. Real names, historical reference.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>

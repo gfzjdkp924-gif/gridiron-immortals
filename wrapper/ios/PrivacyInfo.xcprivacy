@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Gridiron Immortals — the app-level Apple privacy manifest.
+
+  WHY THIS FILE EXISTS. Since spring 2024 App Store Connect asks for a privacy
+  manifest, and a WKWebView app without one is flagged at upload review. The
+  Capacitor iOS project ships its own manifest inside the Capacitor framework;
+  this is the APP's own, and it is what Xcode bundles with the app target.
+
+  HOW TO INSTALL IT (see /home/team/shared/appstore/store-build-runbook.md):
+  after `npx cap add ios` / `npx cap sync`, copy this file into the generated
+  Xcode project's app group (in Xcode: right-click the "App" group → Add Files
+  to "App"… → this file, and tick "Copy items if needed" and the App target), or
+  drop it at `ios/App/App/PrivacyInfo.xcprivacy` before running `npx cap sync`.
+
+  WHY THESE VALUES, CHECKED AGAINST THE CODE:
+    - NSPrivacyTracking = false, and no tracking domains. The game has no
+      analytics, no ad or social SDK, no third-party script and no cookie
+      (verified by grepping the built bundle: the only outside address a web
+      build contains is the owner's own payment link, and the STORE build
+      contains no outside address at all).
+    - NSPrivacyCollectedDataTypes declares the three data types the App Store
+      Connect "App Privacy" form declares, and they are deliberately the SAME
+      three — an app whose form answers and whose manifest disagree is the one
+      question this file exists to prevent (checked against
+      appstore/privacy-data-collection.md and appstore/submit-checklist.md §2
+      step 6, 2026-10-05):
+        ProductInteraction (Usage Data) — NOT linked, NOT tracking, Analytics.
+          One boolean per finished season (first-run or not), no identifier:
+          src/lib/run-stats.ts, src/routes/api/run-count.ts.
+        GameplayContent (User Content) — LINKED, NOT tracking, App Functionality.
+          The season the player CHOOSES to post: the display name they type, the
+          record and the 11-man lineup, published on the public board.
+          src/lib/board-api.ts (submitToBoard), src/routes/api/leaderboard.ts.
+        UserID (Identifiers) — LINKED, NOT tracking, App Functionality. The
+          one-way player key: sha256 of a random 32-hex token the browser itself
+          generated, never the token, and never touched to IDFA/IDFV.
+          src/server/player-key.ts; crediting and the profile page key on it.
+      THIS ARRAY USED TO BE EMPTY, and that was wrong: it said "the app collects
+      nothing", while the form the owner files says User Content and a User ID,
+      both linked. The form is the conservative story and it wins. Nothing about
+      the app changed — this is the manifest catching up to the honest answer.
+      The season is Apple's "User Content → Gameplay Content" sub-type (record
+      and lineup + the player's own display name), not "Other User Content".
+      ProductInteraction is declared for completeness with the other two: an
+      uploaded privacy manifest that lists User Content and a User ID while
+      omitting the one Usage Data type the app does send would be its own
+      inconsistency.
+    - NSPrivacyAccessedAPITypes lists the four categories Apple requires a
+      reason for in a WKWebView app. The reasons are the standard, documented
+      ones for the platform itself (WebKit reading its own storage and the
+      system clock), not for anything this game does:
+        CA92.1  access to information inside the app's own container
+                (localStorage: runs, display name, device token)
+        35F9.1  system boot time, used by WebKit for its timers
+        E174.1  disk space, used by WebKit for its caches
+        C617.1  file timestamps inside the app's own container
+-->
+<plist version="1.0">
+<dict>
+    <key>NSPrivacyTracking</key>
+    <false/>
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeProductInteraction</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeGameplayContent</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeUserID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+    </array>
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>35F9.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>E174.1</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>C617.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

@@ -1,0 +1,715 @@
+# =====================================================================================
+#  Gridiron Immortals — Android/Google Play release build, on a GitHub ubuntu runner
+# =====================================================================================
+#
+#  WHAT THIS IS. One button press turns the code in this repository into a SIGNED
+#  release **.aab** (Android App Bundle) that is ready to be uploaded to a Google Play
+#  closed test. It runs on GitHub's own Linux machine, so nobody on the team needs
+#  Android Studio, a Mac, or a local Android toolchain — and the team's own machine
+#  cannot host one (no Java, no Android SDK, ~2 GB of disk free). The whole job is
+#  free on a public repo, and on a private one it is a few Linux minutes
+#  (ubuntu runners are $0.008/minute at 2026-10-05 rates:
+#  https://docs.github.com/en/billing/reference/actions-minute-multipliers).
+#
+#  WHAT IT DOES **NOT** DO. It does not upload anything to Google Play. The Play
+#  Console upload is a manual, owner-driven step (see the runbook), because a first
+#  release needs the store listing, the content declarations and the price to exist
+#  first, and because a Play account needs two-factor and human judgement. The
+#  optional API upload is DOCUMENTED at the bottom of this file and NOT implemented.
+#
+#  ===== WHAT MUST EXIST BEFORE THE FIRST RUN (five things) ===========================
+#
+#  1. THIS REPOSITORY ON GITHUB, with Actions enabled. Only the owner can do this.
+#
+#  2. FOUR REPOSITORY SECRETS — repo Settings → Secrets and variables → Actions →
+#     "New repository secret" (or scoped to the GitHub *environment* named on the job
+#     below; see the `environment:` key):
+#        ANDROID_KEYSTORE_BASE64     the upload keystore, base64-encoded, ONE line
+#                                    (the exact command that produces it is in
+#                                    /home/team/shared/secrets/README-keystore.txt)
+#        ANDROID_KEYSTORE_PASSWORD   the store password
+#        ANDROID_KEY_ALIAS           the key's alias
+#        ANDROID_KEY_PASSWORD        the key password
+#     **This keystore is the app's signing identity.** It is a credential: never
+#     commit it, never paste it into a chat, never email it. Losing it does not lose
+#     the app, but it does mean asking Google to reset the upload key, which is a
+#     support request with a wait.
+#
+#  3. A GOOGLE PLAY CONSOLE ACCOUNT with the app record created for the applicationId
+#     `com.gridironimmortals.game` (Play Console → Create app). The AAB cannot be
+#     uploaded to a package name that has no app record.
+#     https://support.google.com/googleplay/android-developer/answer/9859152
+#
+#  4. THE UPSTREAM DECISION the owner still owes: is this app PAID or FREE? It changes
+#     nothing about the bundle this workflow builds — one bundle is correct either way —
+#     but a paid app's closed-test testers must each buy it:
+#       "Paid apps: Testers must purchase paid apps when participating in open or
+#        closed tests."
+#     https://support.google.com/googleplay/android-developer/answer/9845334
+#     And the choice is hard to reverse in one direction:
+#       "You can change your app from paid to free. Once your app has been offered for
+#        free, the app can't be changed to paid."
+#     https://support.google.com/googleplay/android-developer/answer/6334373
+#
+#  5. WHO HAS THE PLAY CONSOLE PASSWORD. This workflow needs none of it — that is the
+#     point — but the manual upload step does.
+#
+#  HOW TO RUN IT. GitHub → this repository → Actions → "Android Play bundle (AAB)" →
+#  "Run workflow", with three numbers:
+#     version_code  — the build number Play uses to order uploads. **Play rejects a
+#                     bundle whose versionCode it has already seen**, so every upload
+#                     needs a bigger one. The default is the workflow run number, which
+#                     only ever goes up; override it only to match a scheme of your own.
+#     version_name  — what "1.0.0" or "1.0.1" is called in the store listing.
+#     target_sdk    — 36 (see the API-36 box below). Do not lower it.
+#  Roughly 10–20 minutes, most of it Gradle's first-run downloads. When it finishes,
+#  read the run **Summary**: it says what was built and what still has to happen in the
+#  Play Console. The .aab is attached to the run as a download — that file is what you
+#  upload to Play.
+#
+#  ===== THE THREE GOOGLE RULES THIS BUILD IS SHAPED BY ==============================
+#
+#  (a) IT MUST BE AN .aab, AND PLAY APP SIGNING IS IN PLAY.
+#      "From August 2021, new apps are required to publish with the Android App Bundle
+#       on Google Play."
+#      https://developer.android.com/guide/playcore/feature-delivery
+#      Play App Signing — Google holds the app signing key; we hold the *upload* key
+#      and sign the uploaded bundle with it:
+#      "With Play App Signing, Google manages and protects your app's signing key…"
+#      https://support.google.com/googleplay/android-developer/answer/7384423
+#      That is why this workflow signs with an upload keystore from the secrets, and
+#      why losing it is recoverable (Google resets the upload key) but never trivial.
+#
+#  (b) IT MUST TARGET ANDROID 16 / API 36.
+#      "Starting August 31 2026: New apps and app updates must target Android 16
+#       (API level 36) or higher to be submitted to Google Play."
+#      https://developer.android.com/google/play/requirements/target-sdk
+#      Capacitor 8.5.2's own android-template already sets compileSdkVersion and
+#      targetSdkVersion to 36 (read out of `variables.gradle` in the package the CLI
+#      ships), but a template can change, so this workflow does not rely on it: step 11
+#      sets both explicitly from the inputs and then re-reads the file to prove it, and
+#      step 16 checks the built bundle's own merged manifest.
+#
+#  (c) THE FIRST RELEASE IS REVIEWED BEFORE ANY TESTER CAN INSTALL IT.
+#      "If your app's first release roll-out is on an Internal test track, the
+#       submission must be reviewed before it can be published. Reviews can take a few
+#       hours or up to seven days…"
+#      https://support.google.com/googleplay/android-developer/answer/9859654
+#      And a personal account created now must run a closed test before production:
+#      "At least 12 testers must be opted in to your closed test when you apply for
+#       production access, and they must have been opted in continuously for the
+#       preceding 14 days."
+#      https://support.google.com/googleplay/android-developer/answer/14151465
+#      None of that is this workflow's business, and all of it is why this workflow is
+#      built to hand the owner a correct bundle on the first run rather than on the
+#      third.
+#
+#  ===== WHAT IS AND IS NOT VERIFIED (read this before trusting the file) =============
+#  Nothing has ever run this workflow: there is no repository yet, and there is no
+#  Android toolchain on the team's machine to run one. What HAS been verified by
+#  running something, on 2026-10-05:
+#    • the YAML parses; `actionlint` 1.7.7 is clean; every `run:` block passes `bash -n`;
+#      shellcheck is clean except for the usual `${{ … }}` noise it cannot parse
+#    • the launcher-icon steps were run for real against a synthetic Android project
+#      seeded with Capacitor 8.5.2's own template (its real bytes, extracted from
+#      node_modules/@capacitor/cli/assets/android-template.tar.gz), twice, and the
+#      assertion refuses the placeholder in four different ways — 13 checks, all
+#      passing: bash /home/team/shared/tools/proof-android-icon-steps.sh
+#    • the AAB content guard (step 17) was run for real against synthetic bundles built
+#      to the shape of a real .aab — including one carrying the web shop — 10 checks,
+#      all passing: bash /home/team/shared/tools/proof-aab-content-guard.sh
+#    • every fact about the runner image and the toolchain below was read from the
+#      image's own manifest, and every Google rule is quoted from Google's own page
+#  Untested by design (nothing can test them without the repo, the owner's Play account
+#  and a real Android SDK): whether `npx cap add android` succeeds on that image,
+#  whether Gradle's first run downloads what it needs, whether the keystore the owner
+#  stores in the secrets is the one this build expects, whether AGP accepts the
+#  appended Gradle block, and everything about the Play Console upload. Expect the first
+#  run to be a shakedown run; the runbook says what to do with its log.
+# =====================================================================================
+
+name: Android Play bundle (AAB)
+
+# Manual only. Nothing here runs on a push: an upload-ready bundle should be a
+# decision, and the first run must not happen before the secrets exist.
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: "versionCode — MUST be bigger than any code already uploaded to Play (Play rejects a repeat)"
+        required: false
+        default: "1"
+      version_name:
+        description: "versionName — what users see (e.g. 1.0.0)"
+        required: false
+        default: "1.0.0"
+      target_sdk:
+        description: "targetSdk — 36 is required by Play for new apps; do not lower it"
+        required: false
+        default: "36"
+      compile_sdk:
+        description: "compileSdk — must be >= targetSdk (36)"
+        required: false
+        default: "36"
+
+permissions:
+  contents: read
+
+# Two bundles racing for the same versionCode is a guaranteed Play rejection, so never
+# cancel one in favour of the other.
+concurrency:
+  group: android-play
+  cancel-in-progress: false
+
+jobs:
+  build-aab:
+    # GitHub-hosted Ubuntu runner. `ubuntu-24.04` is the label; `ubuntu-latest` points
+    # at the same image today, and pinning the year is what keeps the toolchain
+    # (Java, Android SDK) from moving under us without a decision.
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # Optional and free: the four secrets may live here (Settings → Environments →
+    # google-play) so the whole repository cannot read them. Nothing below requires the
+    # environment to be pre-created with any settings.
+    environment: google-play
+
+    env:
+      # The app's identity, written down once. MUST match capacitor.config.ts.
+      APPLICATION_ID: com.gridironimmortals.game
+      # md5 of appstore/icons/play-icon-512.png, i.e. of the artwork the submission
+      # package ships (the in-repo copy is wrapper/android/play-icon-512.png). If the
+      # artwork is ever replaced, THREE things move together or this job fails on
+      # purpose: the file in appstore/icons/, the copy in wrapper/android/, and this
+      # number. The generated icon set is not asserted by a stored md5 — it is
+      # re-rendered and compared byte for byte, which survives an image-library change.
+      EXPECTED_ICON_MD5: ac3ac94abf2e711a06c8412049aa97ca
+
+    steps:
+      # ---------------------------------------------------------------------------------
+      # 1. Get the code, and the toolchains the build needs.
+      # ---------------------------------------------------------------------------------
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # Everything below uses paths relative to the repository root, so the root has to
+      # BE the website project folder. Cheap to check, and it turns the single most
+      # confusing first-run failure ("Cannot find module package.json") into one clear
+      # sentence.
+      - name: Check the repository root is the website project
+        run: |
+          set -euo pipefail
+          for f in package.json capacitor.config.ts tools/store-build-check.mjs tools/aab-content-guard.sh tools/android-icons.py wrapper/android/play-icon-512.png; do
+            test -f "$f" || {
+              echo "::error::$f is missing at the repository root. This workflow expects the repository root to be the website project folder itself (the one holding package.json and capacitor.config.ts) — not a parent folder that contains it."
+              exit 1
+            }
+          done
+          echo "repository root looks right: package.json, capacitor.config.ts, the store guard, the AAB guard and the launcher icons are all here"
+
+      # Bun is how this project is built locally (bun.lock is in the repo).
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Node + npx, because the Capacitor CLI (`npx cap …`) is what generates the
+      # Android Studio project. Node 22 is the current LTS.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ---------------------------------------------------------------------------------
+      # JAVA. The build runs Gradle 8.14.3 with Android Gradle Plugin 8.13.0 — both read
+      # out of the project's own files, which `npx cap add android` generates from
+      # Capacitor 8.5.2's template (`android/gradle/wrapper/gradle-wrapper.properties`
+      # and `android/build.gradle`). AGP 8.x requires JDK 17 or newer
+      # (https://developer.android.com/build/jdks) and Gradle 8.14 runs on 17–24, so
+      # Temurin **21** is chosen: it satisfies the floor, it is what current Android
+      # Studio itself ships, and a newer JDK can always consume older bytecode.
+      # The runner image already has 17 (default) and 21 installed — this step only makes
+      # the choice explicit rather than depending on JAVA_HOME. Verified against the
+      # image's own manifest, which lists `17.0.20+1 (default)` and `21.0.12+1`:
+      # https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+      # `actions/setup-java` is GitHub's supported action for this:
+      # https://github.com/actions/setup-java
+      # ---------------------------------------------------------------------------------
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      # ---------------------------------------------------------------------------------
+      # 2. Rebuild the paid app's web bundle FROM SOURCE, with the guard on.
+      #    `bun run store:www:android` == the guarded store build (`bun run build:store`, whose
+      #    STORE_BUILD=1 lives inside package.json — never typed here) PLUS assembling
+      #    www-store/ and checking that the bundle addresses the API absolutely.
+      #    The guard is tools/store-build-check.mjs: if the bundle still contains the
+      #    payment link, the /unlock route, "first run free" or the $4.99 price, the
+      #    script exits non-zero and THIS JOB FAILS.
+      #    `bun run build:store` alone would leave the CHECKED-IN www-store/ in place,
+      #    which is exactly the folder this workflow must not trust.
+      #    Google's rule that makes it necessary — a paid download must not steer anyone
+      #    to an outside payment:
+      #    https://support.google.com/googleplay/android-developer/answer/10281818
+      # ---------------------------------------------------------------------------------
+      - name: Rebuild the store wrapper, guarded (fails the job on any purchase surface)
+        run: bun run store:www:android
+
+      # ---------------------------------------------------------------------------------
+      # 3. The Android SDK. The runner image ships a complete one — ANDROID_HOME and
+      #    ANDROID_SDK_ROOT both point at /usr/local/lib/android/sdk, and the installed
+      #    platforms include android-36 (rev 2) and android-36.1, with build-tools 36.0.0
+      #    present. Verified from the image's own manifest:
+      #    https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+      #    So this step INSTALLS NOTHING in the normal case: it asserts the SDK is there,
+      #    prints what it found, and only reaches for `sdkmanager` if the platform this
+      #    build targets is genuinely missing (which is what would happen if a future
+      #    target_sdk input were raised above what the image ships). That keeps the build
+      #    from depending on a download that may not be there.
+      # ---------------------------------------------------------------------------------
+      - name: Check the Android SDK, and install the target platform only if it is missing
+        env:
+          TARGET_SDK: ${{ inputs.target_sdk }}
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then
+            echo "::error::no Android SDK found (ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT ANDROID_HOME=$ANDROID_HOME). This job expects a GitHub-hosted ubuntu runner, whose image ships one; the note above this step is where that is written down."
+            exit 1
+          fi
+          echo "SDK: $SDK"
+          echo "platforms installed:"; ls "$SDK/platforms" 2>/dev/null || true
+          echo "build-tools installed:"; ls "$SDK/build-tools" 2>/dev/null || true
+          if [ -d "$SDK/platforms/android-$TARGET_SDK" ]; then
+            echo "ok: platforms/android-$TARGET_SDK is already installed — nothing to download"
+            exit 0
+          fi
+          echo "platforms/android-$TARGET_SDK is NOT installed; installing it with sdkmanager"
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(find "$SDK" -maxdepth 4 -name sdkmanager -type f 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "$SDKM" ]; then
+            echo "::error::platforms/android-$TARGET_SDK is missing and no sdkmanager was found under $SDK to install it."
+            exit 1
+          fi
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" "platforms;android-$TARGET_SDK"
+          echo "installed: $(ls -d "$SDK/platforms/android-$TARGET_SDK")"
+
+      # ---------------------------------------------------------------------------------
+      # 4. The Android project: CREATE IT the first time, SYNC IT afterwards.
+      #    WHICH BRANCH THIS TAKES ON THE FIRST RUN: `android/` is NOT in the repository
+      #    today, so the first run takes the `cap add android` branch and creates the
+      #    project on the runner. Every run after that (once the generated project is
+      #    committed) takes the `cap sync android` branch. Both are handled and the choice
+      #    is printed, so there is no ambiguity about which ran.
+      #    `cap sync` is not optional even on a fresh project: it is what copies
+      #    www-store/ into android/app/src/main/assets/public/ and what GENERATES
+      #    android/app/capacitor.build.gradle and android/settings.gradle's
+      #    `apply from: 'capacitor.settings.gradle'`, without which Gradle fails outright.
+      #    The Capacitor packages (cli, core, ios, android) are PINNED EXACT at 8.5.2 in
+      #    package.json, so `bun install --frozen-lockfile` above already installed the
+      #    exact versions this wrapper is built against and nothing floats.
+      #    Capacitor's own Android documentation: https://capacitorjs.com/docs/android
+      # ---------------------------------------------------------------------------------
+      - name: Add the Android project, or sync the existing one
+        run: |
+          set -euo pipefail
+          npx cap --version
+          if [ -d android ]; then
+            echo "BRANCH: android/ exists in the repository -> npx cap sync android"
+            npx cap sync android
+          else
+            echo "BRANCH: android/ does not exist -> npx cap add android (creating the Android Studio project)"
+            npx cap add android
+            npx cap sync android
+          fi
+          chmod +x android/gradlew
+          test -f android/app/capacitor.build.gradle || {
+            echo "::error::android/app/capacitor.build.gradle was not generated — 'npx cap sync android' did not finish. Read that step's log."
+            exit 1
+          }
+          test -d android/app/src/main/assets/public || {
+            echo "::error::android/app/src/main/assets/public/ is missing — the app's own web files were never copied in. Read that step's log."
+            exit 1
+          }
+          echo "web files copied into the project: $(find android/app/src/main/assets/public -type f | wc -l) files"
+
+      # ---------------------------------------------------------------------------------
+      # 5. The app's identity, checked where it can be checked exactly.
+      #    Play keys an app to its applicationId (`com.gridironimmortals.game`), and a
+      #    bundle built under a different one cannot be uploaded to this app's record at
+      #    all. It comes from capacitor.config.ts via the CLI; this asserts the value
+      #    actually reached the generated Gradle project, rather than assuming it did.
+      # ---------------------------------------------------------------------------------
+      - name: Assert the generated project carries our applicationId
+        run: |
+          set -euo pipefail
+          if grep -q "applicationId \"$APPLICATION_ID\"" android/app/build.gradle; then
+            echo "ok: android/app/build.gradle declares applicationId \"$APPLICATION_ID\""
+          else
+            echo "::error::android/app/build.gradle does not declare applicationId \"$APPLICATION_ID\". It must come from capacitor.config.ts (appId) — do not edit this by hand, fix the config or the sync step. Found:"
+            grep -n 'applicationId\|namespace' android/app/build.gradle | sed 's/^/  /'
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------------------
+      # 6. Version, targets and signing — set from the RUN INPUTS, then read back.
+      #    Why append a block instead of editing the generated file: the generated
+      #    `android/app/build.gradle` comes from a template that may change shape, and
+      #    brace surgery on someone else's file is how a build breaks silently. Gradle
+      #    merges several `android { }` blocks into the same extension, so a block
+      #    appended at the end configures the same project — and every value it sets can
+      #    then be re-read from the file and asserted, which is what the second half of
+      #    this step does.
+      #
+      #    WHY versionCode IS AN INPUT. Play orders uploads by versionCode and refuses a
+      #    bundle whose code it has already seen. Tying it to the run number means a
+      #    re-run can never collide with the last upload.
+      #
+      #    WHY THE PASSWORDS COME FROM ENVIRONMENT VARIABLES AND NOT `-P`. A `-P` property
+      #    is visible in the build log and in the process list; an environment variable
+      #    is not, and GitHub masks secret values in logs as well.
+      # ---------------------------------------------------------------------------------
+      - name: Set the bundle's version, API level and release signing
+        env:
+          GRADLE_FILE: android/app/build.gradle
+          VERSION_CODE: ${{ inputs.version_code }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          TARGET_SDK: ${{ inputs.target_sdk }}
+          COMPILE_SDK: ${{ inputs.compile_sdk }}
+        run: |
+          set -euo pipefail
+          for v in VERSION_CODE VERSION_NAME TARGET_SDK COMPILE_SDK; do
+            [ -n "${!v:-}" ] || { echo "::error::$v is empty — the workflow input did not come through."; exit 1; }
+          done
+          python3 - "$GRADLE_FILE" <<'PY'
+          import os, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          text = path.read_text()
+          marker = "// ===== CI: appended by .github/workflows/android-play.yml ====="
+          # Re-derive rather than patch: running this twice must leave the same file.
+          text = text.split(marker)[0].rstrip() + "\n"
+          path.write_text(text + "\n" + f'''{marker}
+          android {{
+              compileSdk = {os.environ["COMPILE_SDK"]}
+              defaultConfig {{
+                  targetSdk = {os.environ["TARGET_SDK"]}
+                  versionCode {os.environ["VERSION_CODE"]}
+                  versionName "{os.environ["VERSION_NAME"]}"
+              }}
+              signingConfigs {{
+                  release {{
+                      storeFile file(System.getenv("GI_KEYSTORE_PATH"))
+                      storePassword System.getenv("GI_KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("GI_KEY_ALIAS")
+                      keyPassword System.getenv("GI_KEY_PASSWORD")
+                  }}
+              }}
+              buildTypes {{
+                  release {{
+                      signingConfig signingConfigs.release
+                  }}
+              }}
+          }}
+          ''')
+          print(f"appended the CI block to {path}")
+          PY
+          # Prove it: every value this build depends on must be readable from the file.
+          grep -q "^    compileSdk = $COMPILE_SDK$" "$GRADLE_FILE" || { echo "::error::compileSdk = $COMPILE_SDK is not in $GRADLE_FILE"; exit 1; }
+          grep -q "^        targetSdk = $TARGET_SDK$" "$GRADLE_FILE" || { echo "::error::targetSdk = $TARGET_SDK is not in $GRADLE_FILE"; exit 1; }
+          grep -q "^        versionCode $VERSION_CODE$" "$GRADLE_FILE" || { echo "::error::versionCode $VERSION_CODE is not in $GRADLE_FILE"; exit 1; }
+          grep -q "^        versionName \"$VERSION_NAME\"$" "$GRADLE_FILE" || { echo "::error::versionName $VERSION_NAME is not in $GRADLE_FILE"; exit 1; }
+          grep -q "signingConfig signingConfigs.release" "$GRADLE_FILE" || { echo "::error::the release build type is not pointed at our signing config"; exit 1; }
+          echo "the CI block is in $GRADLE_FILE:"
+          sed -n '/^\/\/ ===== CI: appended/,$p' "$GRADLE_FILE" | sed 's/^/  /'
+
+      # ---------------------------------------------------------------------------------
+      # 7. THE LAUNCHER ICON.
+      #    `npx cap add android` copies Capacitor's template, which carries **Android
+      #    Studio's default placeholder launcher icon** — a blue and white cross on a
+      #    light grid, the artwork Android Studio generates for every new project. This
+      #    build never opens Android Studio and never runs its Image Asset wizard, so
+      #    without this step the AAB uploaded to Play would wear that placeholder.
+      #    tools/android-icons.py writes the full set (5 densities × square / round /
+      #    adaptive-foreground, the two `mipmap-anydpi-v26` adaptive-icon XML files, and
+      #    the background colour resource) from the in-repo copy of the Play icon, using
+      #    nothing but the Python standard library — no Pillow, no ImageMagick, so it
+      #    cannot depend on what a runner image happens to ship. It also deletes every
+      #    `ic_launcher*` file the template left behind, including the two vector
+      #    drawables (`res/drawable/ic_launcher_background.xml`,
+      #    `res/drawable-v24/ic_launcher_foreground.xml`) that nothing else would notice.
+      #    File names and resource names are kept identical to Capacitor's own template on
+      #    purpose, so `AndroidManifest.xml`'s `@mipmap/ic_launcher` keeps resolving.
+      # ---------------------------------------------------------------------------------
+      - name: Install the launcher icons into the Android project
+        run: |
+          set -euo pipefail
+          python3 tools/android-icons.py install android/app/src/main/res
+
+      # ---------------------------------------------------------------------------------
+      # 8. PRE-BUILD ASSERTION — the gate that makes "the bundle cannot ship with the
+      #    placeholder icon" a checked fact instead of a hope. It looks at the FILES in
+      #    the Android project, not at step 7's exit code: a step can succeed and still
+      #    leave a placeholder in place.
+      #    What it proves, in order: the icon we ship from is the file we think it is
+      #    (md5 against the submission package's artwork); every file of the icon set in
+      #    the project is byte-identical to what this workflow's own generator produces
+      #    from that artwork, right now; no `ic_launcher*` file outside that set exists;
+      #    no file anywhere under res/ is byte-identical to one of the 15 placeholder
+      #    launcher images Capacitor 8.5.2 ships (the md5 list is read out of the
+      #    template); and the manifest still points at the icon names we installed.
+      # ---------------------------------------------------------------------------------
+      - name: Assert the launcher icon is ours, not the placeholder
+        run: |
+          set -euo pipefail
+          ART=wrapper/android/play-icon-512.png
+          ACTUAL_MD5="$(md5sum "$ART" | cut -d' ' -f1)"
+          if [ "$ACTUAL_MD5" != "$EXPECTED_ICON_MD5" ]; then
+            echo "::error::$ART is not the icon this build is supposed to ship (md5 $ACTUAL_MD5, expected $EXPECTED_ICON_MD5). Either the artwork was replaced without updating EXPECTED_ICON_MD5, or the file is not the PNG it claims to be. Stopping before the build."
+            exit 1
+          fi
+          echo "artwork: $ART (md5 $ACTUAL_MD5 — the Play icon from the submission package)"
+          python3 tools/android-icons.py verify android/app/src/main/res
+          for ref in '@mipmap/ic_launcher' '@mipmap/ic_launcher_round'; do
+            grep -qF "$ref" android/app/src/main/AndroidManifest.xml || {
+              echo "::error::AndroidManifest.xml does not reference $ref, so the icons this job installed would be packed but never used."
+              exit 1
+            }
+          done
+          echo "ok: AndroidManifest.xml references @mipmap/ic_launcher and @mipmap/ic_launcher_round"
+
+      # ---------------------------------------------------------------------------------
+      # 9. The upload keystore, from the secrets.
+      #    Play App Signing means Google holds the key that signs what users install; this
+      #    keystore is the UPLOAD key that proves the bundle came from us. Google:
+      #    https://support.google.com/googleplay/android-developer/answer/7384423
+      #    The base64 text is decoded into the runner's temp directory, outside the
+      #    checkout. The content is never echoed: only a shape check, then `keytool` is
+      #    asked to read it back, which is also what proves the store password and the
+      #    alias the owner stored are the right ones — a failure here is far cheaper than
+      #    a failure fifteen minutes into Gradle.
+      # ---------------------------------------------------------------------------------
+      - name: Write the upload keystore from the repository secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP is the runner's own scratch directory (documented default
+          # environment variable, always set, and NEVER inside the checkout) — so the
+          # keystore is written somewhere it cannot be committed by accident and cannot
+          # be picked up by an artifact upload. The workflow expression `runner.temp` is
+          # not available in a job-level `env:` block, which is why this is expanded here.
+          KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+          missing=""
+          [ -n "$KEYSTORE_B64" ] || missing="$missing ANDROID_KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing ANDROID_KEYSTORE_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="$missing ANDROID_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing — see the comments at the top of this workflow for what each one is, and /home/team/shared/secrets/README-keystore.txt for how the keystore is written down."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH" || { echo "::error::ANDROID_KEYSTORE_BASE64 decoded to nothing — it must be the output of \`base64 -w0 upload-keystore.jks\`, one line, no wrapping."; exit 1; }
+          echo "keystore written: $(wc -c < "$KEYSTORE_PATH" | tr -d ' ') bytes"
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS"
+
+      # Fail fast on the missing-secret class of mistake: a run that dies at Gradle after
+      # ten minutes is much harder to read than one that dies here.
+      - name: Preflight — signing secrets and the Android project
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing ANDROID_KEYSTORE_PASSWORD"
+          [ -n "$KEY_PASSWORD" ] || missing="$missing ANDROID_KEY_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="$missing ANDROID_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing. The key password is usually the same as the store password; store it separately anyway, so a future keystore with a different pair does not need this file changed."
+            exit 1
+          fi
+          test -d android || { echo "::error::android/ is missing — the Capacitor step did not run."; exit 1; }
+          test -s "$RUNNER_TEMP/upload-keystore.jks" || { echo "::error::the upload keystore was not written to \$RUNNER_TEMP — read the previous step's log."; exit 1; }
+          java -version 2>&1 | head -1
+          echo "preflight ok: the signing secrets are present, the keystore is on the runner, and the Android project is in place"
+
+      # ---------------------------------------------------------------------------------
+      # 10. THE BUILD. `bundleRelease` is the task that produces an .aab (a release APK
+      #     would be `assembleRelease`, and Play no longer accepts an APK for a new app).
+      #     Every signing value comes from the environment variables named in the block
+      #     step 6 appended, so nothing secret is on the command line.
+      # ---------------------------------------------------------------------------------
+      - name: Build the signed release AAB
+        env:
+          GI_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          GI_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          GI_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          # The appended Gradle block reads these four from the environment, so nothing
+          # secret is ever on a command line. The path is expanded here for the same
+          # reason as in the keystore step: `runner.temp` is not available in an `env:`.
+          export GI_KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+          test -f "$GI_KEYSTORE_PATH" || { echo "::error::the keystore is not at $GI_KEYSTORE_PATH — the earlier step that decodes it did not run."; exit 1; }
+          cd android
+          ./gradlew bundleRelease --console=plain --stacktrace
+          ls -l app/build/outputs/bundle/release/
+
+      # ---------------------------------------------------------------------------------
+      # 11. THE BUNDLE'S OWN MANIFEST. Gradle keeps the manifest it merged for the
+      #     release build as TEXT XML inside the build directory, which makes the two
+      #     things Play judges verifiable on the artifact that was just produced: the
+      #     target API level (rule (b) at the top of this file) and the version code Play
+      #     will use to order the upload. The .aab itself stores its manifest as protobuf,
+      #     so this is the readable copy of the same information.
+      # ---------------------------------------------------------------------------------
+      - name: Check the built bundle's manifest — API level and version code
+        env:
+          TARGET_SDK: ${{ inputs.target_sdk }}
+          VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          MANIFEST="$(find android/app/build/intermediates -name AndroidManifest.xml -path '*release*' -newer android/app/build.gradle 2>/dev/null | head -1 || true)"
+          if [ -z "$MANIFEST" ]; then
+            MANIFEST="$(find android/app/build/intermediates -name AndroidManifest.xml -path '*release*' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "$MANIFEST" ]; then
+            echo "::warning::could not find the merged release manifest under android/app/build/intermediates to read back. The build itself succeeded; this check is the cheap confirmation of the API level and version code, and its absence means those two facts are unconfirmed for this run."
+            exit 0
+          fi
+          echo "merged manifest: $MANIFEST"
+          grep -o 'android:targetSdkVersion="[0-9]*"' "$MANIFEST" | head -1 || true
+          grep -o 'android:versionCode="[0-9]*"' "$MANIFEST" | head -1 || true
+          grep -q "android:targetSdkVersion=\"$TARGET_SDK\"" "$MANIFEST" || {
+            echo "::error::the merged release manifest does not declare android:targetSdkVersion=\"$TARGET_SDK\". Play requires Android 16 / API 36 for new apps: https://developer.android.com/google/play/requirements/target-sdk"
+            exit 1
+          }
+          grep -q "android:versionCode=\"$VERSION_CODE\"" "$MANIFEST" || {
+            echo "::error::the merged release manifest does not declare android:versionCode=\"$VERSION_CODE\" — the number Play will read is not the number this run was asked for."
+            exit 1
+          }
+          echo "ok: targetSdkVersion=$TARGET_SDK and versionCode=$VERSION_CODE are in the manifest that went into the bundle"
+
+      # ---------------------------------------------------------------------------------
+      # 12. THE AAB CONTENT GUARD — the Android twin of the iOS build's store guard, and
+      #     the check that protects this app from a purchase-surface rejection.
+      #     `bun run store:www:android` already refused to build a web bundle with the web shop in
+      #     it, but what Gradle packs is whatever is in
+      #     `android/app/src/main/assets/public/` at that moment (a stale copy from an
+      #     earlier run, a sync against a web build, a hand-copied folder). Nothing else
+      #     in this pipeline opens the finished .aab, so this is the one check that runs
+      #     against the artifact that would actually be uploaded.
+      #     tools/aab-content-guard.sh unzips it, proves it is an app bundle with web
+      #     assets, and searches every text file inside for the four surfaces that must
+      #     not be in a paid download — the Stripe payment link, the /unlock route,
+      #     "first run free", and $4.99 — the same four markers the iOS guard uses.
+      # ---------------------------------------------------------------------------------
+      - name: Verify the bundle's contents are the guarded store build
+        run: |
+          set -euo pipefail
+          AAB=android/app/build/outputs/bundle/release/app-release.aab
+          test -f "$AAB" || { echo "::error::$AAB was not produced — read the Gradle step's log above."; exit 1; }
+          # The same address the store build is bound to (src/lib/site.ts, via
+          # src/lib/api-base.ts): inside a bundled app the pages are local files on the
+          # app's own origin, so a relative /api/… call would go to the app itself and the
+          # boards, profiles and counters would be dead while looking fine in a browser.
+          # shellcheck disable=SC2016  # the ${…} is JavaScript, inside `bun -e`, not shell
+          API_BASE="$(bun -e 'import { SITE_URL } from "./src/lib/site.ts"; process.stdout.write(`${SITE_URL}/api`)')"
+          echo "app's API address: $API_BASE"
+          bash tools/aab-content-guard.sh "$AAB" "$API_BASE"
+
+      # ---------------------------------------------------------------------------------
+      # 13. Hand the owner the file. The .aab is what gets uploaded to Play Console by
+      #     hand, so it is attached to the run as a download; the merged manifest that
+      #     steps 11 checked is attached beside it as evidence of what was built.
+      #     Kept even when an earlier check failed: a failed verification should not cost
+      #     a rebuild, and the artifact is the evidence either way.
+      # ---------------------------------------------------------------------------------
+      - name: Keep the AAB as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab-${{ github.run_number }}
+          path: |
+            android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ---------------------------------------------------------------------------------
+      # 14. THE OPTIONAL NEXT STEP, DOCUMENTED AND NOT IMPLEMENTED: uploading to Play
+      #     from here with the Google Play Developer API.
+      #     The manual Play Console upload is the primary path on purpose — a first
+      #     release needs the listing, the content declarations and the price configured
+      #     before the bundle can be submitted (see the runbook), two-factor is involved,
+      #     and a personal account's closed test needs 12 real testers anyway. But when
+      #     the app is live and releases become routine, the same upload can be a step in
+      #     this job instead of a browser session:
+      #       • a Google Cloud service account, granted access under Play Console →
+      #         Users and permissions, and its JSON key stored as a repository secret;
+      #       • the API's edit/upload/commit sequence against the `edits` resource —
+      #         POST /applications/{packageName}/edits, then
+      #         POST …/edits/{editId}/bundles (the .aab), then
+      #         POST …/edits/{editId}:commit;
+      #       • documented here: https://developers.google.com/android-publisher
+      #         and the Cloud-based alternative, https://developers.google.com/android-publisher/api-ref/rest
+      #     Nothing above is implemented, and nothing above is needed to run a closed
+      #     test. It is written down so the next person does not have to rediscover it.
+      # ---------------------------------------------------------------------------------
+
+      # The one-page result, for someone who should not have to read the whole log.
+      - name: Write the run summary
+        if: always()
+        env:
+          TARGET_SDK: ${{ inputs.target_sdk }}
+        run: |
+          {
+            echo "## Android bundle run"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version / code | \`${{ inputs.version_name }} (${{ inputs.version_code }})\` |"
+            echo "| Target API | $TARGET_SDK (Android 16) |"
+            if ls android/app/build/outputs/bundle/release/*.aab >/dev/null 2>&1; then
+              echo "| .aab | built — $(du -h android/app/build/outputs/bundle/release/*.aab | cut -f1); **also attached to this run as a download — that file is what you upload to Play** |"
+            else
+              echo "| .aab | **not built** — read the Gradle step's log above |"
+            fi
+            echo "| Store-build guard | see step 'Rebuild the store wrapper, guarded' |"
+            echo "| Launcher icon | see step 'Assert the launcher icon is ours, not the placeholder' |"
+            echo "| Bundle contents | see step 'Verify the bundle's contents are the guarded store build' |"
+            echo ""
+            echo "### What happens next — and it is not this workflow"
+            echo ""
+            echo "1. **Download the \`.aab\` from this run's *Artifacts* section.**"
+            echo "2. **Upload it in Play Console** (Test and release → Testing → Closed testing →"
+            echo "   Create new release). Play Console is a browser job with two-factor; nothing"
+            echo "   here can or should do it for you."
+            echo "3. **Before your first release can be reviewed you need the store listing, the"
+            echo "   content declarations and the price** — the click-by-click is in"
+            echo "   \`appstore/submit-checklist.md\` §Android, and the owner's half of the job is"
+            echo "   \`appstore/store-build-runbook.md\`."
+            echo "4. **Reviews can take hours to seven days** for a first release, and a personal"
+            echo "   account must then run a closed test with 12 testers opted in for 14 days"
+            echo "   before production: https://support.google.com/googleplay/android-developer/answer/14151465"
+            echo "5. **Every later upload needs a bigger \`versionCode\`.** Play refuses one it has"
+            echo "   already seen — re-run this workflow with a higher number."
+            echo ""
+            echo "_The workflow is new and has never run against a real Play account. If it"
+            echo "failed, the failing step's log is the whole story; the runbook's Android"
+            echo "section says what it means and who fixes it._"
+          } >> "$GITHUB_STEP_SUMMARY"
