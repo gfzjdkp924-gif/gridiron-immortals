@@ -129,6 +129,103 @@ jobs:
 
     steps:
       # ---------------------------------------------------------------------------------
+      # ---------------------------------------------------------------------------------
+      # 0. THE FOUR SECRETS, BEFORE ANYTHING ELSE. This step costs seconds; every step
+      #    below it costs minutes (the web build, CocoaPods, `cap add ios`, the archive).
+      #    A secret that is missing, empty or malformed is named here, in the run's first
+      #    ten seconds, instead of surfacing as a signing failure twenty minutes into a
+      #    build — or, worse, as a green run that uploaded nothing.
+      #    No secret value is ever printed: presence, shape and length only.
+      #    MEASURED, NOT ASSUMED — on 2026-10-05 this file's own step bodies were run
+      #    against synthetic secrets (absent, empty and mangled, one at a time), with the
+      #    exact output of each recorded. Two things that used to pass silently and are
+      #    refused here now: a Key ID with a trailing space (the space ends up INSIDE the
+      #    file name Apple's Transporter searches for, so the run dies after the whole
+      #    build with "AuthKey_XXXX .p8" not found), and a .p8 whose body the paste
+      #    truncated or flattened (the file was written happily, and Apple's tools then
+      #    rejected it at signing time). The .p8's bytes get their own check in the step
+      #    that writes it to disk.
+      # ---------------------------------------------------------------------------------
+      - name: Preflight — the four required secrets (seconds, not minutes)
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MARKETING_VERSION: ${{ inputs.marketing_version }}
+        run: |
+          set -euo pipefail
+          ok=1
+
+          # 1. PRESENT AT ALL. A repository secret that was never created and one saved
+          #    with an empty value are both the empty string here — and both are fatal.
+          #    Each is named individually, so the log says which box to fix.
+          for v in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 APPLE_TEAM_ID; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::secret $v is missing or empty. Add it under Settings → Secrets and variables → Actions → New repository secret (or under the environment named on this job). What it is and where Apple displays it: the comments at the top of this workflow."
+              ok=0
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::stopping before the build: this workflow needs exactly four secrets — ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8, APPLE_TEAM_ID. Nothing was built and nothing was uploaded; fix the secret(s) named above and run it again."
+            exit 1
+          fi
+
+          # 2. SHAPE — no whitespace inside the three hand-copied IDs. Checked here rather
+          #    than stripped, on purpose: these same values build the key FILE NAME
+          #    (AuthKey_<Key ID>.p8) and sign the upload's JWT further down the job, so a
+          #    value that needs trimming has to be fixed in the secret itself.
+          for v in ASC_KEY_ID ASC_ISSUER_ID APPLE_TEAM_ID; do
+            case "${!v}" in
+              *[[:space:]]*)
+                echo "::error::secret $v contains a space, a tab or a line break. Re-copy the value from Apple and save it again with nothing before or after it — a pasted trailing space ends up inside the file name Apple's tools search for."
+                ok=0
+                ;;
+            esac
+          done
+
+
+          # 4. THE KEY — the wrong thing pasted (the Key ID, the file name, the public
+          #    key) is caught here; the bytes themselves are checked by the step below
+          #    that writes the key to disk, which owns that file.
+          case "$ASC_KEY_P8" in
+            *"BEGIN PRIVATE KEY"*) ;;
+            *)
+              echo "::error::ASC_KEY_P8 does not contain a 'BEGIN PRIVATE KEY' line. This secret must be the TEXT of the AuthKey_<KEY_ID>.p8 file Apple let you download once — not its file name, not the Key ID, and not a certificate."
+              ok=0
+              ;;
+          esac
+
+          # 5. THE VERSION — this input becomes CFBundleShortVersionString, which Apple
+          #    accepts only as one to three period-separated integers. An empty or
+          #    mistyped box is rejected at UPLOAD, i.e. after the whole build.
+          if ! printf '%s' "$MARKETING_VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::error::marketing_version is \"$MARKETING_VERSION\" (a workflow input). Apple accepts one to three period-separated numbers — leave the input at its default, 1.0.0, or type another version of that form."
+            ok=0
+          fi
+
+          if [ "$ok" != 1 ]; then
+            exit 1
+          fi
+
+          # 3. LENGTH — warnings only, and only reached when checks 1, 2, 4 and 5 all
+          #    passed: a run that is stopping for a real problem should not bury it under
+          #    warnings about the same secrets. Apple's Key ID and Team ID are both 10
+          #    characters and the Issuer ID is a UUID; if Apple ever issues another shape
+          #    the run still goes ahead, it just says so.
+          for v in ASC_KEY_ID APPLE_TEAM_ID; do
+            val="${!v}"
+            if [ "${#val}" -ne 10 ]; then
+              echo "::warning::$v is ${#val} characters; Apple's Key ID and Team ID are both 10. Continuing — check it against App Store Connect."
+            fi
+          done
+          case "$ASC_ISSUER_ID" in
+            *-*-*-*) ;;
+            *) echo "::warning::ASC_ISSUER_ID does not look like the UUID Apple prints above the key list. Continuing — check it against App Store Connect." ;;
+          esac
+
+          echo "preflight: all four secrets are present and shaped like what Apple issues; marketing_version=$MARKETING_VERSION. (Nothing from a secret is printed here, not even a length.)"
+
       # 1. Get the code, and the two toolchains the build needs.
       # ---------------------------------------------------------------------------------
       - name: Check out the repository
@@ -431,6 +528,13 @@ jobs:
             if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi
           }
 
+          # The file itself, before its hash: `file_md5` on a missing path dies inside
+          # md5sum with a bare "No such file or directory" and no ::error:: annotation, so
+          # the run stops for a reason the log never states. Naming it here costs two lines.
+          test -f "$ICON_SRC" || {
+            echo "::error::$ICON_SRC is not in the repository, so this build cannot ship the App Store icon (it would archive Capacitor's placeholder instead). The icon is checked in on purpose — see the header of this workflow."
+            exit 1
+          }
           src_md5="$(file_md5 "$ICON_SRC")"
           if [ "$src_md5" != "$EXPECTED_MD5" ]; then
             echo "::error::$ICON_SRC is not the icon this build is supposed to ship (md5 $src_md5, expected $EXPECTED_MD5). Either the artwork was replaced without updating this assertion, or the file is not the PNG it claims to be. Stopping before the archive."
@@ -521,12 +625,78 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p private_keys
-          printf '%s\n' "$ASC_KEY_P8" > "$KEY_FILE"
+          # The secret arrives through the ENVIRONMENT (never on a command line: an
+          # argument is visible in `ps`), and it is NORMALISED AND CHECKED before it is
+          # written. Both halves were measured against this very step on 2026-10-05 with
+          # deliberately broken keys:
+          #   • normalising — a key pasted through a Windows editor or a text field arrives
+          #     with CR line endings, or with its newlines flattened or lost. Written as-is
+          #     that file is not a usable PEM, but the old check here looked for one line
+          #     ('BEGIN PRIVATE KEY') and so passed it: the run continued and the failure
+          #     surfaced at SIGNING time, twenty minutes later, as an authentication error
+          #     that says nothing about the secret. The key is now re-emitted as canonical
+          #     PEM — BEGIN line, body wrapped at 64 columns, END line, nothing else — so
+          #     what lands on disk does not depend on how the paste was made.
+          #   • checking — a truncated paste (END line lost), a flattened paste, and a body
+          #     that is not base64 at all each passed the old one-line grep and were written
+          #     to disk. Each now stops HERE, printing ::error:: and naming ASC_KEY_P8.
+          # python3 is on GitHub's macOS runner images; the icon steps already use it.
+          KEY="$(python3 - <<'PY'
+          import base64, os, sys
+
+          BEGIN = "-----BEGIN PRIVATE KEY-----"
+          END = "-----END PRIVATE KEY-----"
+
+
+          def fail(why):
+              print(
+                  "::error::ASC_KEY_P8 " + why + ". This secret must be the TEXT of "
+                  "Apple's AuthKey_<KEY_ID>.p8 file, which downloads once: BEGIN and END "
+                  "lines included, pasted as a multi-line secret with nothing added or "
+                  "removed.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+
+          text = (
+              os.environ.get("ASC_KEY_P8", "")
+              .replace("\r\n", "\n")
+              .replace("\r", "\n")
+              .strip()
+          )
+          if not text:
+              fail("is empty")
+          if BEGIN not in text:
+              fail("has no 'BEGIN PRIVATE KEY' line")
+          if END not in text:
+              fail("has the BEGIN line but no 'END PRIVATE KEY' line, so the paste is truncated")
+          body = "".join(text.split(BEGIN, 1)[1].split(END, 1)[0].split())
+          if not body:
+              fail("has nothing between its BEGIN and END lines")
+          try:
+              der = base64.b64decode(body, validate=True)
+          except Exception:
+              fail("has a key body that is not base64, so the file was mangled by the paste")
+          if len(der) < 64 or der[0] != 0x30:
+              fail("did not decode to a private key, so the file was mangled by the paste")
+          length_octet = der[1]
+          if length_octet < 0x80:
+              header, declared = 2, length_octet
+          else:
+              count = length_octet & 0x7F
+              if count == 0 or count > 4:
+                  fail("did not decode to one complete private key")
+              header = 2 + count
+              declared = int.from_bytes(der[2:2 + count], "big")
+          if header + declared != len(der):
+              fail("did not decode to one complete private key, so the paste is truncated")
+          print("\n".join([BEGIN] + [body[i:i + 64] for i in range(0, len(body), 64)] + [END]))
+          PY
+          )"
+          printf '%s\n' "$KEY" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
-          if ! grep -q 'BEGIN PRIVATE KEY' "$KEY_FILE"; then
-            echo "::error::ASC_KEY_P8 does not look like a .p8 private key (no 'BEGIN PRIVATE KEY' line). Paste the entire file, including the BEGIN and END lines, as a multi-line secret."
-            exit 1
-          fi
+          unset KEY
           echo "wrote $KEY_FILE ($(wc -c < "$KEY_FILE" | tr -d ' ') bytes, permissions $(stat -f '%Lp' "$KEY_FILE"))"
 
       # Fail fast on the missing-secret class of mistake: a run that dies at the archive
@@ -678,7 +848,16 @@ jobs:
           # best-effort, so check the finished .ipa rather than assuming. A warning, not a
           # failure: an .ipa without the manifest can still be uploaded, and this is the
           # one thing worth knowing before the submission rather than after it.
-          if unzip -l "$IPA" | grep -q 'PrivacyInfo.xcprivacy'; then
+          # The listing goes to a file and is grepped there, NOT piped into `grep -q`.
+          # Under `set -o pipefail` a pipe whose reader exits at the first match kills
+          # the writer with SIGPIPE (141), and the whole pipeline then reports failure —
+          # so a .ipa that DOES contain the manifest took the else branch below and this
+          # step printed a warning telling the owner to go and fix a manifest that was
+          # already inside the .ipa. Measured on 2026-10-05: it misfires from about 600
+          # entries of `unzip -l` output upwards, and the listing is also worth keeping as
+          # evidence of what was uploaded.
+          unzip -l "$IPA" > "$RUNNER_TEMP/ipa-contents.txt" 2>&1 || true
+          if grep -q 'PrivacyInfo.xcprivacy' "$RUNNER_TEMP/ipa-contents.txt"; then
             echo "privacy manifest: present inside the .ipa"
           else
             echo "::warning::this .ipa contains no PrivacyInfo.xcprivacy — the manifest step did not get the file into the App target. Fix before submitting: commit the generated ios/ folder with the file added to the App target, or read the comment on step 5. Apple: https://developer.apple.com/documentation/bundleresources/privacy-manifest-files"
