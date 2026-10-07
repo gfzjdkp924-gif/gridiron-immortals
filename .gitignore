@@ -41,3 +41,7 @@ src/routeTree.gen.ts
 id_rsa*
 /android/
 /www-store/
+
+# Python bytecode caches from tools/*.py run in CI or by hand.
+__pycache__/
+*.pyc
