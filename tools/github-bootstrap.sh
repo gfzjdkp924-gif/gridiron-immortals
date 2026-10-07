@@ -750,14 +750,237 @@ with 'npx cap add android', which is the branch it is written for."}
 }
 
 # ------------------------------------------------------------------ --set-secrets -----
+# =====================================================================================
+#  SIGNING-MATERIAL GUARD — BEGIN
+#  Extracted verbatim from this file by tools/proof-android-secret-extraction.sh (the
+#  harness cuts between the two markers), so every assertion below is exercised against
+#  synthetic README fixtures without a token and without touching GitHub.
+#
+#  WHY IT EXISTS. On 2026-10-05 the first CI runs of android-play.yml started with wrong
+#  values in the repository. The extractors used to read the README's value column with
+#  `sed 's/^  key alias *//p'`, which keeps everything after the label — and
+#  /home/team/shared/secrets/README-keystore.txt is a human document with an annotation
+#  column. So GitHub received a 41-character alias (`gridiron-upload      ->
+#  ANDROID_KEY_ALIAS`) and a 57-character key password, and the runner stopped with
+#  `keytool error: java.lang.Exception: Alias <…> does not exist`. The old pre-upload
+#  check asked only whether the STORE password opened the keystore, and printed each
+#  value's length as a bare number with nothing to compare it to, so "41 chars" looked
+#  like a fact rather than the bug.
+#
+#  WHAT IT GUARANTEES NOW. Before a single `gh secret set` runs, all four of these must
+#  hold, and every value's length is printed next to the length it is supposed to have:
+#    (a) the extracted store password opens the keystore        (keytool -list)
+#    (b) the extracted alias EXISTS in that keystore            (keytool -list -alias)
+#    (c) the extracted key password WORKS for that alias        (keytool -certreq, which
+#        needs the private key's own password and is the same proof Gradle's signing step
+#        needs)
+#    (d) the base64 about to be uploaded decodes to the same md5 as the local .jks
+#  Any failure refuses the upload, names the secret, and exits non-zero: no CI run is
+#  spent on values that are already known to be wrong. When one value fails,
+#  verify_signing_material() itself prints the `REFUSING TO UPLOAD` banner and then a
+#  `named by the guard:` line per failed secret — from this one place, so the CI log, the
+#  --set-secrets entry point and the fixture harness all say the same thing.
+# =====================================================================================
+# The store password's length. It is a fact about this keystore, measured at creation
+# (README-keystore.txt, 2026-10-05), and it is the one expectation keytool cannot tell us:
+# an annotated value that survives extraction is caught here. Override only if the
+# keystore itself is ever replaced.
+EXPECTED_STORE_PASSWORD_LEN=${BOOTSTRAP_STORE_PASSWORD_LEN:-28}
+# readme_value <label> — the VALUE of a labelled line in the keystore README.
+# The README is written for a human: a label, an optional value column, and then sometimes
+# `-> SECRET_NAME` and a trailing parenthetical. The value is the FIRST whitespace-
+# delimited token after the label; anything after it is annotation and is dropped. That is
+# what makes `  key alias   gridiron-upload   -> ANDROID_KEY_ALIAS` yield the alias and not
+# the alias plus its annotation.
+readme_value() {
+  local label=$1 pat val
+  # A label's spaces become "one or more spaces" in BRE syntax (`\+` is a GNU extension;
+  # a bare `+` after a bracket expression is a LITERAL plus, which is the bug that made the
+  # first version of this function return nothing at all).
+  pat=$(printf '%s' "$label" | sed 's/[[:space:]][[:space:]]*/[[:space:]][[:space:]]*/g')
+  val=$(sed -n "s/^[[:space:]]*${pat}[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\).*/\1/p" "$KEYSTORE_README" | head -1)
+  # A line whose value column is empty (only the annotation was written) must read as
+  # empty — never as the annotation, which would be uploaded as a value.
+  case "$val" in '->'*) val="" ;; esac
+  printf '%s' "$val"
+}
 # Values are read into shell variables and handed to gh on STDIN (gh reads the secret from
 # stdin when --body is absent), so no password ever reaches argv.
 secret_value_keystore_b64() { base64 -w0 "$KEYSTORE_FILE"; }
-secret_value_store_password() { sed -n 's/^  store password *//p' "$KEYSTORE_README" | head -1; }
-secret_value_key_alias() { sed -n 's/^  key alias *//p' "$KEYSTORE_README" | head -1; }
-secret_value_key_password() {
-  sed -n 's/^  key password *//p' "$KEYSTORE_README" | head -1 | sed 's/ *(same value.*$//' | sed 's/ *$//'
+secret_value_store_password() { readme_value 'store password'; }
+secret_value_key_alias() { readme_value 'key alias'; }
+secret_value_key_password() { readme_value 'key password'; }
+# keystore_entry_aliases <store password> — the entry alias(es) inside the keystore, one
+# per line, read with the password we are about to upload. keytool prints
+# `<alias>, <date>, <type>, …`, so everything from the first comma on is dropped. Empty
+# output means either the password is wrong or the keystore has no entries.
+keystore_entry_aliases() {
+  GI_LIST_PW=$1 keytool -list -keystore "$KEYSTORE_FILE" -storepass:env GI_LIST_PW </dev/null 2>/dev/null |
+    sed -n '/\(PrivateKeyEntry\|SecretKeyEntry\|trustedCertEntry\)/ s/,.*$//p'
 }
+# keystore_opens_with <store password> — 0 when keytool opens the keystore with it.
+keystore_opens_with() {
+  GI_LIST_PW=$1 keytool -list -keystore "$KEYSTORE_FILE" -storepass:env GI_LIST_PW </dev/null >/dev/null 2>&1
+}
+# keytool_alias_exists <store password> <alias> — 0 when that alias is an entry in it.
+# The alias travels on the command line (it is an entry NAME, not a credential — the
+# workflow itself passes it this way); the password never does.
+keytool_alias_exists() {
+  GI_LIST_PW=$1 keytool -list -keystore "$KEYSTORE_FILE" -storepass:env GI_LIST_PW -alias "$2" </dev/null >/dev/null 2>&1
+}
+# keystore_key_password_works <store password> <alias> <key password> — 0 when keytool can
+# read the private key for that alias with that key password. `-certreq` is the cheapest
+# operation that actually unwraps the private key, so it fails on a wrong key password and
+# succeeds on a right one (proved both ways in the harness).
+keystore_key_password_works() {
+  local csr rc
+  csr=$(mktemp "${TMPDIR:-/tmp}/gi-certreq.XXXXXX")
+  GI_KS_PW=$1 GI_KEY_PW=$3 keytool -certreq -alias "$2" -keystore "$KEYSTORE_FILE" \
+    -storepass:env GI_KS_PW -keypass:env GI_KEY_PW -file "$csr" </dev/null >/dev/null 2>&1
+  rc=$?
+  rm -f -- "$csr"
+  return "$rc"
+}
+# keystore_b64_alignment <candidate base64> — decodes it and compares md5s with the local
+# .jks. Sets B64_MD5_LOCAL / B64_MD5_DECODED for the caller's message. 0 when identical.
+keystore_b64_alignment() {
+  local tmp rc
+  tmp=$(mktemp "${TMPDIR:-/tmp}/gi-b64check.XXXXXX")
+  printf '%s' "$1" | base64 -d >"$tmp" 2>/dev/null
+  rc=$?
+  B64_MD5_LOCAL=$(md5sum "$KEYSTORE_FILE" 2>/dev/null | awk '{print $1}')
+  B64_MD5_DECODED=$(md5sum "$tmp" 2>/dev/null | awk '{print $1}')
+  rm -f -- "$tmp"
+  [ "$rc" -eq 0 ] && [ -n "$B64_MD5_LOCAL" ] && [ "$B64_MD5_LOCAL" = "$B64_MD5_DECODED" ]
+}
+# verify_signing_material — the guard. Prints one line per value (length next to expected
+# length), records PASS/FAIL through this script's own pass/fail helpers, and returns 0
+# only when every check above passed. Callers MUST refuse to upload on non-zero.
+verify_signing_material() {
+  local alias spw kpw b64 alen splen kplen b64len fsize b64exp entries exp_alias exp_len
+  local ok=0
+  alias=$(secret_value_key_alias)
+  spw=$(secret_value_store_password)
+  kpw=$(secret_value_key_password)
+  b64=$(secret_value_keystore_b64)
+  alen=${#alias}; splen=${#spw}; kplen=${#kpw}; b64len=${#b64}
+  fsize=$(stat -c %s "$KEYSTORE_FILE" 2>/dev/null || printf '0')
+  b64exp=$(( (fsize + 2) / 3 * 4 ))
+
+  if ! command -v keytool >/dev/null 2>&1; then
+    fail "signing material: the three keytool checks" \
+         "keytool is not installed, so the store password, the alias and the key password cannot be proved — refusing to upload values that cannot be checked"
+    return 1
+  fi
+
+  # (a) the store password opens the keystore.
+  local entries_ok=0
+  if [ "$splen" -ne "$EXPECTED_STORE_PASSWORD_LEN" ]; then
+    fail "ANDROID_KEYSTORE_PASSWORD (length)" \
+         "extracted $splen chars, expected $EXPECTED_STORE_PASSWORD_LEN — the value is probably carrying annotation from $KEYSTORE_README"
+    print_value_len ANDROID_KEYSTORE_PASSWORD "$splen" "$EXPECTED_STORE_PASSWORD_LEN"
+  elif keystore_opens_with "$spw"; then
+    pass "ANDROID_KEYSTORE_PASSWORD ($splen chars) opens $KEYSTORE_FILE"
+    print_value_len ANDROID_KEYSTORE_PASSWORD "$splen" "$EXPECTED_STORE_PASSWORD_LEN"
+    entries_ok=1
+  else
+    fail "ANDROID_KEYSTORE_PASSWORD (keytool)" \
+         "$splen chars, expected $EXPECTED_STORE_PASSWORD_LEN (length is right, so this is the wrong value): keytool cannot open $KEYSTORE_FILE with it"
+    print_value_len ANDROID_KEYSTORE_PASSWORD "$splen" "$EXPECTED_STORE_PASSWORD_LEN"
+  fi
+
+  # (b) the alias exists in the keystore. The expected alias is MEASURED out of the
+  # keystore it has to be found in, never assumed.
+  if [ "$entries_ok" -eq 1 ]; then
+    entries=$(keystore_entry_aliases "$spw")
+    if [ -z "$entries" ]; then
+      fail "ANDROID_KEY_ALIAS" "the keystore reports no key entry at all, so no alias can be right — investigate it before uploading"
+    elif [ "$(printf '%s\n' "$entries" | grep -c .)" != "1" ]; then
+      fail "ANDROID_KEY_ALIAS" "the keystore holds $(printf '%s\n' "$entries" | grep -c .) entries; this script assumes exactly one — refusing rather than guessing"
+    else
+      exp_alias=$(printf '%s' "$entries" | head -1)
+      exp_len=${#exp_alias}
+      if [ "$alen" -ne "$exp_len" ]; then
+        fail "ANDROID_KEY_ALIAS (length)" \
+             "extracted $alen chars, expected $exp_len (the keystore's only entry, '$exp_alias') — an over-long alias means extraction kept the README's annotation column"
+        print_value_len ANDROID_KEY_ALIAS "$alen" "$exp_len"
+      elif keytool_alias_exists "$spw" "$alias"; then
+        pass "ANDROID_KEY_ALIAS ($alen chars) is an entry in $KEYSTORE_FILE"
+        print_value_len ANDROID_KEY_ALIAS "$alen" "$exp_len"
+      else
+        fail "ANDROID_KEY_ALIAS (keytool)" \
+             "$alen chars, same length as the keystore's entry '$exp_alias' but not equal to it — keytool says alias <$alias> does not exist"
+        print_value_len ANDROID_KEY_ALIAS "$alen" "$exp_len"
+      fi
+    fi
+  else
+    skip "ANDROID_KEY_ALIAS" "the store password did not open the keystore, so its entries could not be listed"
+    print_value_len ANDROID_KEY_ALIAS "$alen" "?"
+  fi
+
+  # (c) the key password works for that alias. Length alone cannot decide this: a
+  # 28-character wrong password has the right length and still fails, which is why the
+  # check is a real keytool operation.
+  local kp_len_note
+  if [ "$kplen" -eq "$splen" ] && [ "$kpw" = "$spw" ]; then
+    kp_len_note="$splen (the same value as the store password, as $KEYSTORE_README records)"
+  elif [ "$kplen" -eq "$splen" ]; then
+    kp_len_note="$splen (same length as the store password but a different value)"
+  else
+    kp_len_note="$splen when it is the same value as the store password; this one is a different value"
+  fi
+  if [ "$alen" -eq 0 ] || [ "$kplen" -eq 0 ]; then
+    fail "ANDROID_KEY_PASSWORD" "empty value — check $KEYSTORE_README"
+  elif [ "$entries_ok" -eq 1 ] && [ -n "${exp_len:-}" ] && [ "$alen" -eq "$exp_len" ] && keystore_key_password_works "$spw" "$alias" "$kpw"; then
+    pass "ANDROID_KEY_PASSWORD ($kplen chars) opens the private key for alias '$alias'"
+    print_value_len ANDROID_KEY_PASSWORD "$kplen" "$kp_len_note"
+  else
+    fail "ANDROID_KEY_PASSWORD (keytool)" \
+         "$kplen chars: keytool cannot read the private key for alias '${alias:-<empty>}' with it — this is the check that catches a key password carrying its README annotation"
+    print_value_len ANDROID_KEY_PASSWORD "$kplen" "$kp_len_note"
+  fi
+
+  # (d) the base64 about to be uploaded is this keystore.
+  if keystore_b64_alignment "$b64"; then
+    pass "ANDROID_KEYSTORE_BASE64 ($b64len chars) decodes to md5 $B64_MD5_DECODED = the local keystore"
+    print_value_len ANDROID_KEYSTORE_BASE64 "$b64len" "$b64exp"
+  else
+    fail "ANDROID_KEYSTORE_BASE64" \
+         "decodes to md5 ${B64_MD5_DECODED:-<nothing>} but $KEYSTORE_FILE is md5 ${B64_MD5_LOCAL:-<unreadable>} — the value being uploaded is not this file"
+    print_value_len ANDROID_KEYSTORE_BASE64 "$b64len" "$b64exp"
+  fi
+
+  local n
+  n=$(grep -c '^FAIL|' "$RESULTS_FILE" 2>/dev/null || true)
+  if [ "${n:-0}" -eq 0 ]; then ok=1; fi
+  unset alias spw kpw b64
+  if [ "${ok:-0}" -eq 1 ]; then return 0; fi
+  # THE SINGLE REFUSAL PATH. Every caller gets the same one unmistakable line saying the
+  # upload is refused, followed by the name of each secret that failed — and this is where
+  # it lives, not in the caller, so a run of this function on its own (exactly what
+  # tools/proof-android-secret-extraction.sh does) says it too. The caller sees a non-zero
+  # status and must not upload anything. printf only, plus $RESULTS_FILE: the harness that
+  # sources this block defines pass/fail/note/skip and RESULTS_FILE, and nothing else.
+  printf '\n'
+  printf '   REFUSING TO UPLOAD. At least one value above is not the value the keystore\n'
+  printf '   accepts, so nothing was set in GitHub and no CI run should be spent on it.\n'
+  printf '   An annotation column read as part of a value is the usual cause.\n'
+  local bad
+  if [ -r "$RESULTS_FILE" ]; then
+    while IFS= read -r bad; do
+      [ -n "$bad" ] && printf '   named by the guard: %s\n' "$bad"
+    done < <(awk -F'|' '/^FAIL[|]/ { sub(/ \(.*$/, "", $2); if ($2 != "") print $2 }' "$RESULTS_FILE" | LC_ALL=C sort -u)
+  fi
+  return 1
+}
+# print_value_len <name> <actual> <expected> — one line per value, actual next to expected,
+# so a 41-character alias is visible in the log instead of being a bare number.
+print_value_len() {
+  printf '  len  %-26s %5s chars   expected: %s\n' "$1" "$2" "$3"
+}
+# =====================================================================================
+#  SIGNING-MATERIAL GUARD — END
+# =====================================================================================
 secret_value_for() {
   case "$1" in
     ANDROID_KEYSTORE_BASE64)   secret_value_keystore_b64 ;;
@@ -792,17 +1015,17 @@ cmd_set_secrets() {
   done
   pass "the workflow's own secrets.* references are exactly the four the script can fill"
 
-  head1 "2. the values (never printed, never on a command line)"
-  if command -v keytool >/dev/null 2>&1 && [ "$DRY" -eq 0 ]; then
-    local pw
-    pw=$(secret_value_store_password)
-    if [ -n "$pw" ] && GI_CHECK_PW="$pw" keytool -list -keystore "$KEYSTORE_FILE" -storepass:env GI_CHECK_PW >/dev/null 2>&1; then
-      pass "keytool opens $KEYSTORE_FILE with the store password we are about to upload"
-    else
-      fail "keystore check" "keytool could not open the keystore with that store password — do not spend a CI run on it"
-    fi
-  else
-    skip "keystore check" "keytool not installed (or --dry-run)"
+  head1 "2. the values, and the proof they are the ones the keystore actually accepts"
+  say "   values are never printed and never passed on a command line: only lengths, and"
+  say "   the keystore's md5. The passwords reach keytool through the environment"
+  say "   (-storepass:env / -keypass:env) and gh through stdin."
+  # The refusal banner and the names of the failed secrets are printed by
+  # verify_signing_material itself — the one refusal path — so this log and the fixture
+  # harness (tools/proof-android-secret-extraction.sh) read identically. Nothing was
+  # written to GitHub: every value is proved before the first `gh secret set` below.
+  if ! verify_signing_material; then
+    summary || true
+    exit 1
   fi
   local name val len
   for name in "${SECRET_NAMES_EXPECTED[@]}"; do

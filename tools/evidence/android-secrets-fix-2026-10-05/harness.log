@@ -1,0 +1,99 @@
+
+=== 1. the shipped guard block is cut out of tools/github-bootstrap.sh verbatim
+  guard block: 223 lines, sha256 abc06251042ee2405d7bab11915d7bbcd277d516cdb9992469870f7e52cc406e
+  [ok]   the block is non-empty (223 lines)
+  [ok]   the block defines verify_signing_material()
+  [ok]   the block defines readme_value()
+
+=== 2. the real README's three values, read through the shipped extractor (lengths only)
+  store password  28 chars (the README says 28)
+  key alias       15 chars (the keystore has one entry, 15 chars)
+  key password    28 chars (the same value as the store password)
+  [ok]   the store password extracts to 28 characters
+  [ok]   the alias extracts to 15 characters
+  [ok]   the key password extracts to 28 characters
+
+=== 3. regression: the extractors that shipped the bug, run on today's annotated line
+  old extractor on that line: alias 42 chars (wc -c, includes the newline), key password 58
+  new extractor on that line: alias 15 chars, key password 28
+  [ok]   the old extractor yields the 41-character alias that GitHub received
+  [ok]   the new extractor yields the alias alone
+
+=== 4. the guard on the 'annotated.txt' fixture must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   nothing refused
+
+=== 5. the guard on the 'bare.txt' fixture must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   nothing refused
+
+=== 6. the guard on the 'padded.txt' fixture must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   nothing refused
+
+=== 7. the guard on the 'wrong-alias.txt' fixture must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it says it is refusing to upload
+  [ok]   it names ANDROID_KEY_ALIAS
+
+=== 8. the guard on the 'annotation-only.txt' fixture must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it says it is refusing to upload
+  [ok]   it names ANDROID_KEY_ALIAS
+
+=== 9. the guard on the 'wrong-keypw.txt' fixture must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it says it is refusing to upload
+  [ok]   it names ANDROID_KEY_PASSWORD
+
+=== 10. the guard on the 'long-storepw.txt' fixture must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it says it is refusing to upload
+  [ok]   it names ANDROID_KEYSTORE_PASSWORD
+
+=== 11. (d) the base64 alignment check refuses a keystore that is not this file
+  real .jks md5     bbe0a0487ad07f3989ddfbfa6fd4abbc
+  what the uploaded base64 decodes to  d8960d85cba79c9f1be8d9f47e2e120c
+  [ok]   a base64 that decodes to a different file than /tmp/gi-secret-proof.01MAO8/tampered.jks is refused (rc=1)
+  [ok]   the real base64 still passes (md5 d8960d85cba79c9f1be8d9f47e2e120c)
+
+=== 12. the real --set-secrets entry point, in --dry-run, on each fixture
+
+=== 13. --set-secrets --dry-run on 'annotated.txt' must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   it reaches the upload step with four gh secret set commands (saw 4)
+
+=== 14. --set-secrets --dry-run on 'bare.txt' must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   it reaches the upload step with four gh secret set commands (saw 4)
+
+=== 15. --set-secrets --dry-run on 'padded.txt' must pass
+  [ok]   exit status is 0 (wanted 0)
+  [ok]   it reaches the upload step with four gh secret set commands (saw 4)
+
+=== 16. --set-secrets --dry-run on 'wrong-alias.txt' must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it never reaches the upload step (saw 0 gh secret set commands)
+  [ok]   it names ANDROID_KEY_ALIAS
+
+=== 17. --set-secrets --dry-run on 'annotation-only.txt' must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it never reaches the upload step (saw 0 gh secret set commands)
+  [ok]   it names ANDROID_KEY_ALIAS
+
+=== 18. --set-secrets --dry-run on 'wrong-keypw.txt' must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it never reaches the upload step (saw 0 gh secret set commands)
+  [ok]   it names ANDROID_KEY_PASSWORD
+
+=== 19. --set-secrets --dry-run on 'long-storepw.txt' must refuse
+  [ok]   exit status is 1 (wanted 1)
+  [ok]   it never reaches the upload step (saw 0 gh secret set commands)
+  [ok]   it names ANDROID_KEYSTORE_PASSWORD
+
+=== 20. the real README, through the real entry point
+  [ok]   it exits 0
+  [ok]   all four values pass the guard and reach the upload step (saw 4)
+
+=====================================================================
+RESULT: PASS — every fixture behaved as required (0 failed expectations)

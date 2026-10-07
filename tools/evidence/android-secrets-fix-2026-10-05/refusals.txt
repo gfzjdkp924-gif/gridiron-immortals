@@ -1,0 +1,69 @@
+### 1. verify_signing_material() called directly — the path the harness exercises,
+###    and the one that used to refuse without saying so.
+###    guard block: 223 lines, sha256 abc06251042ee2405d7bab11915d7bbcd277d516cdb9992469870f7e52cc406e
+
+  [FAIL] ANDROID_KEYSTORE_PASSWORD (length)
+  len  ANDROID_KEYSTORE_PASSWORD     40 chars   expected: 28
+  [skip] ANDROID_KEY_ALIAS
+  len  ANDROID_KEY_ALIAS             13 chars   expected: ?
+  [FAIL] ANDROID_KEY_PASSWORD (keytool)
+  len  ANDROID_KEY_PASSWORD          28 chars   expected: 40 when it is the same value as the store password; this one is a different value
+  [PASS] ANDROID_KEYSTORE_BASE64 (2992 chars) decodes to md5 d8960d85cba79c9f1be8d9f47e2e120c = the local keystore
+  len  ANDROID_KEYSTORE_BASE64     2992 chars   expected: 2992
+
+   REFUSING TO UPLOAD. At least one value above is not the value the keystore
+   accepts, so nothing was set in GitHub and no CI run should be spent on it.
+   An annotation column read as part of a value is the usual cause.
+   named by the guard: ANDROID_KEYSTORE_PASSWORD
+   named by the guard: ANDROID_KEY_PASSWORD
+
+verify_signing_material exit status: 1  (non-zero = the caller must not upload)
+
+### 2. the real --set-secrets entry point, --dry-run, on the same fixture.
+###    Note there is exactly ONE banner: it comes from the guard, and the caller
+###    no longer repeats it.
+
+== 2. the values, and the proof they are the ones the keystore actually accepts
+-------------------------------------------------------------------------------
+   values are never printed and never passed on a command line: only lengths, and
+   the keystore's md5. The passwords reach keytool through the environment
+   (-storepass:env / -keypass:env) and gh through stdin.
+  [FAIL] ANDROID_KEYSTORE_PASSWORD (length)
+  len  ANDROID_KEYSTORE_PASSWORD     40 chars   expected: 28
+  [skip] ANDROID_KEY_ALIAS
+  len  ANDROID_KEY_ALIAS             13 chars   expected: ?
+  [FAIL] ANDROID_KEY_PASSWORD (keytool)
+  len  ANDROID_KEY_PASSWORD          28 chars   expected: 40 when it is the same value as the store password; this one is a different value
+  [PASS] ANDROID_KEYSTORE_BASE64 (2992 chars) decodes to md5 d8960d85cba79c9f1be8d9f47e2e120c = the local keystore
+  len  ANDROID_KEYSTORE_BASE64     2992 chars   expected: 2992
+
+   REFUSING TO UPLOAD. At least one value above is not the value the keystore
+   accepts, so nothing was set in GitHub and no CI run should be spent on it.
+   An annotation column read as part of a value is the usual cause.
+   named by the guard: ANDROID_KEYSTORE_PASSWORD
+   named by the guard: ANDROID_KEY_PASSWORD
+-------------------------------------------------------------------------------
+== SUMMARY
+-------------------------------------------------------------------------------
+  PASS 2
+  FAIL 2
+  note 0
+  skip 1
+  FAILED: ANDROID_KEYSTORE_PASSWORD (length) — extracted 40 chars, expected 28 — the value is probably carrying annotation from /tmp/gi-refusal-capture.4dTjd6/fake-readme.txt
+  FAILED: ANDROID_KEY_PASSWORD (keytool) — 28 chars: keytool cannot read the private key for alias 'not-the-alias' with it — this is the check that catches a key password carrying its README annotation
+
+RESULT: FAIL (2 problem(s))
+
+--set-secrets exit status: 1
+banners printed: 1
+gh secret set lines reached: 0  (must be 0: nothing was uploaded)
+
+### 3. the real README (/home/team/shared/secrets/README-keystore.txt), old
+###    extractor vs the shipped one. Lengths only; no value is printed.
+
+  ANDROID_KEY_ALIAS      old 41 chars -> shipped 15 chars
+  ANDROID_KEY_PASSWORD   old 57 chars -> shipped 28 chars
+  ANDROID_KEYSTORE_PASSWORD old 28 chars -> shipped 28 chars   (this line has no annotation
+                                                    column, which is why only two of the four were wrong)
+
+  (wc -c counts the trailing newline, so every number above is printed one lower.)
